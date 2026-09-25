@@ -98,11 +98,6 @@
     .instagram-gradient {
       background: linear-gradient(45deg, #f09433 0%, #e6683c 25%, #dc2743 50%, #cc2366 75%, #bc1888 100%);
     }
-
-    .glassmorphism {
-      backdrop-filter: blur(16px);
-      -webkit-backdrop-filter: blur(16px);
-    }
   </style>
 </head>
 <body class="bg-slate-950 text-slate-100 antialiased font-sans selection:bg-brand-500 selection:text-white">
@@ -116,13 +111,8 @@
     const SESSION_ID_KEY = "linkchat_session_id";
     const THEME_KEY = "linkchat_theme";
 
-    // STUN config for WebRTC peer signaling
-    const RTC_CONFIG = {
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
-      ]
-    };
+    // Global Public Internet WebSocket Relay
+    const PUBLIC_WS_API_KEY = "demo"; 
 
     function getSessionToken() {
       let id = sessionStorage.getItem(SESSION_ID_KEY);
@@ -168,7 +158,6 @@
         const u = new URL(url);
         const host = u.hostname.replace("www.", "");
         
-        // Instagram Reel Check
         if (host.includes("instagram.com") && (u.pathname.includes("/reel/") || u.pathname.includes("/p/"))) {
           return {
             type: "instagram",
@@ -179,7 +168,6 @@
           };
         }
 
-        // YouTube or Shorts Check
         if (host.includes("youtube.com") || host.includes("youtu.be")) {
           const isShort = u.pathname.includes("/shorts/");
           let videoId = "";
@@ -229,16 +217,13 @@
             width={size} 
             height={size}
             className="rounded-lg block object-contain"
-            onError={(e) => {
-              e.target.style.display = 'none';
-            }}
+            onError={(e) => { e.target.style.display = 'none'; }}
           />
         </div>
       );
     }
 
     function App() {
-      // Screens: 'landing', 'join', 'chat', 'expired'
       const [screen, setScreen] = useState('landing');
       const [roomIdParam, setRoomIdParam] = useState('');
       const [userToken] = useState(getSessionToken);
@@ -252,7 +237,6 @@
         return localStorage.getItem("linkchat_last_nick") || "";
       });
 
-      // Active room properties
       const [roomData, setRoomData] = useState(null);
       const [messages, setMessages] = useState([]);
       const [participants, setParticipants] = useState([]);
@@ -260,25 +244,22 @@
       const [isLocked, setIsLocked] = useState(false);
       const [timeRemaining, setTimeRemaining] = useState("");
       const [activeTypers, setActiveTypers] = useState({});
+      const [connectionStatus, setConnectionStatus] = useState("connecting"); // 'connected' | 'connecting' | 'offline'
 
-      // Modals & notices
       const [showShareModal, setShowShareModal] = useState(false);
       const [showInfoDrawer, setShowInfoDrawer] = useState(false);
       const [showReactionPickerFor, setShowReactionPickerFor] = useState(null);
       const [copiedNotice, setCopiedNotice] = useState(false);
       const [botActive, setBotActive] = useState(false);
 
-      // Composer State
       const [inputText, setInputText] = useState("");
       const [isTyping, setIsTyping] = useState(false);
       const typingTimeoutRef = useRef(null);
 
-      // References
       const messagesEndRef = useRef(null);
       const broadcastRef = useRef(null);
+      const wsRef = useRef(null);
       const botIntervalRef = useRef(null);
-      const peerConnectionRef = useRef(null);
-      const dataChannelRef = useRef(null);
 
       const toggleTheme = () => {
         const next = !isDarkMode;
@@ -286,7 +267,6 @@
         localStorage.setItem(THEME_KEY, String(next));
       };
 
-      // Hybrid Route detector: checks both ?room=xyz AND /#/room/xyz
       const detectRoomFromUrl = useCallback(() => {
         const urlParams = new URLSearchParams(window.location.search);
         let r = urlParams.get('room');
@@ -325,59 +305,67 @@
         }
       }, [detectRoomFromUrl]);
 
+      // Connect to Real-time Internet WebSocket and Local Multi-Tab Channel
       useEffect(() => {
         if (!roomData?.id) return;
 
-        const channel = new BroadcastChannel(`linkchat_${roomData.id}`);
-        broadcastRef.current = channel;
+        // 1. Same-device multi-tab channel
+        const localChannel = new BroadcastChannel(`linkchat_${roomData.id}`);
+        broadcastRef.current = localChannel;
+        localChannel.onmessage = (event) => handleIncomingPacket(event.data);
 
+        // 2. Global Internet Relay WebSocket (Syncs cross-device phone-to-phone)
+        const cleanRoom = roomData.id.replace(/[^a-zA-Z0-9]/g, '');
+        const wsUrl = `wss://free.blr2.piesocket.com/v3/${cleanRoom}?api_key=${PUBLIC_WS_API_KEY}&notify_self=0`;
+        
+        let ws;
         try {
-          const pc = new RTCPeerConnection(RTC_CONFIG);
-          peerConnectionRef.current = pc;
+          ws = new WebSocket(wsUrl);
+          wsRef.current = ws;
 
-          pc.ondatachannel = (e) => {
-            const dc = e.channel;
-            dataChannelRef.current = dc;
-            dc.onmessage = (msgEvent) => {
-              try {
-                const packet = JSON.parse(msgEvent.data);
-                handleIncomingPacket(packet);
-              } catch (e) {}
-            };
+          ws.onopen = () => {
+            setConnectionStatus("connected");
+            // Announce presence across the internet
+            dispatchPacket({
+              type: 'PARTICIPANT_JOINED',
+              payload: { 
+                token: userToken, 
+                nickname: nickname || "Guest", 
+                avatarColor: getAvatarBg(nickname) 
+              }
+            });
+            // Request room history from any existing host online
+            dispatchPacket({
+              type: 'SYNC_REQUEST',
+              payload: { token: userToken }
+            });
           };
+
+          ws.onmessage = (event) => {
+            try {
+              const packet = JSON.parse(event.data);
+              handleIncomingPacket(packet);
+            } catch (e) {}
+          };
+
+          ws.onerror = () => setConnectionStatus("offline");
+          ws.onclose = () => setConnectionStatus("offline");
         } catch (e) {
-          console.warn("WebRTC initialization skipped: ", e);
+          setConnectionStatus("offline");
         }
 
-        channel.onmessage = (event) => {
-          handleIncomingPacket(event.data);
-        };
-
-        dispatchPacket({
-          type: 'PARTICIPANT_JOINED',
-          payload: { 
-            token: userToken, 
-            nickname: nickname || "Guest", 
-            avatarColor: getAvatarBg(nickname) 
-          }
-        });
-
         return () => {
-          channel.close();
-          if (peerConnectionRef.current) peerConnectionRef.current.close();
+          localChannel.close();
+          if (ws) ws.close();
         };
       }, [roomData?.id]);
 
       const dispatchPacket = (packet) => {
         if (broadcastRef.current) {
-          try {
-            broadcastRef.current.postMessage(packet);
-          } catch (e) {}
+          try { broadcastRef.current.postMessage(packet); } catch (e) {}
         }
-        if (dataChannelRef.current && dataChannelRef.current.readyState === 'open') {
-          try {
-            dataChannelRef.current.send(JSON.stringify(packet));
-          } catch (e) {}
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          try { wsRef.current.send(JSON.stringify(packet)); } catch (e) {}
         }
       };
 
@@ -424,6 +412,45 @@
               return [...prev, payload];
             });
             addSystemMessage(`${payload.nickname} joined the chat`);
+            
+            // If we are host, send active history to newly joined device
+            if (isHost) {
+              dispatchPacket({
+                type: 'SYNC_RESPONSE',
+                payload: {
+                  messages,
+                  participants: [...participants, payload],
+                  isLocked,
+                  expiresAt: roomData?.expiresAt
+                }
+              });
+            }
+            break;
+
+          case 'SYNC_REQUEST':
+            if (isHost) {
+              dispatchPacket({
+                type: 'SYNC_RESPONSE',
+                payload: {
+                  messages,
+                  participants,
+                  isLocked,
+                  expiresAt: roomData?.expiresAt
+                }
+              });
+            }
+            break;
+
+          case 'SYNC_RESPONSE':
+            if (payload.messages && payload.messages.length > 0) {
+              setMessages(payload.messages);
+            }
+            if (payload.participants && payload.participants.length > 0) {
+              setParticipants(payload.participants);
+            }
+            if (payload.isLocked !== undefined) {
+              setIsLocked(payload.isLocked);
+            }
             break;
 
           case 'PARTICIPANT_LEFT':
@@ -843,7 +870,7 @@
                 </span>
               </h1>
               <p className="text-slate-400 text-sm leading-relaxed">
-                Create a private room, share the link or QR code, and communicate directly. No signups, no databases, completely ephemeral.
+                Create a private room, share the link or QR code, and communicate directly across devices. Zero signups, 100% ephemeral.
               </p>
             </div>
 
@@ -981,7 +1008,7 @@
             </div>
             <h2 className="text-2xl font-bold mb-2">Room Has Vanished</h2>
             <p className="text-slate-400 text-sm mb-6 leading-relaxed">
-              This ephemeral room reached its time limit or was destroyed by the host. All messages, images, and session tokens have been completely deleted.
+              This ephemeral room reached its time limit or was destroyed by the host. All messages and sessions have disappeared.
             </p>
             <button
               onClick={() => {
@@ -1032,7 +1059,7 @@
                 </div>
                 <div className="flex items-center gap-2 text-xs text-slate-400">
                   <span className="flex items-center gap-1 text-emerald-400 font-medium">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                    <span className={`w-1.5 h-1.5 rounded-full ${connectionStatus === 'connected' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`}></span>
                     {participants.length} connected
                   </span>
                   <span>•</span>
@@ -1138,7 +1165,6 @@
                             const meta = parseLinkMetadata(rawUrl);
                             if (!meta) return null;
 
-                            // Instagram Reel Card
                             if (meta.type === 'instagram') {
                               return (
                                 <a 
@@ -1167,7 +1193,6 @@
                               );
                             }
 
-                            // YouTube or Shorts Card
                             if (meta.type === 'youtube') {
                               return (
                                 <a 
@@ -1189,7 +1214,6 @@
                               );
                             }
 
-                            // Standard Web Link
                             return (
                               <a 
                                 key={i} 
@@ -1216,7 +1240,6 @@
                       </div>
                     </div>
 
-                    {/* Emoji Reaction Pills */}
                     {msg.reactions && Object.keys(msg.reactions).length > 0 && (
                       <div className="flex flex-wrap gap-1 mt-1 ml-1">
                         {Object.entries(msg.reactions).map(([emoji, users]) => (
@@ -1236,7 +1259,6 @@
                       </div>
                     )}
 
-                    {/* Reaction trigger */}
                     <button
                       onClick={() => setShowReactionPickerFor(showReactionPickerFor === msg.id ? null : msg.id)}
                       className={`absolute top-0 -mt-2 p-1 rounded-full bg-slate-800 border border-slate-700 text-slate-400 hover:text-white transition-opacity shadow-md ${
@@ -1269,7 +1291,6 @@
               );
             })}
 
-            {/* Active typing indicators */}
             {Object.keys(activeTypers).length > 0 && (
               <div className="flex items-center gap-2 text-xs text-slate-400 italic py-1 ml-2 animate-pulse">
                 <div className="flex gap-1">
@@ -1284,7 +1305,7 @@
             <div ref={messagesEndRef} />
           </main>
 
-          {/* Bottom Fixed Composer */}
+          {/* Composer */}
           <footer className={`p-3 border-t backdrop-blur-md sticky bottom-0 z-20 ${
             isDarkMode ? 'bg-slate-900/90 border-slate-800' : 'bg-white/90 border-slate-200'
           }`}>
@@ -1312,7 +1333,7 @@
             </form>
           </footer>
 
-          {/* Share & QR Code Modal */}
+          {/* Share Modal */}
           {showShareModal && (
             <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4 backdrop-blur-sm animate-message">
               <div className="bg-slate-900 border border-slate-800 rounded-3xl max-w-sm w-full p-6 text-center relative shadow-2xl">
@@ -1366,7 +1387,7 @@
             </div>
           )}
 
-          {/* Drawer / Room Settings */}
+          {/* Drawer */}
           {showInfoDrawer && (
             <div className="fixed inset-0 z-50 bg-black/75 flex justify-end backdrop-blur-sm">
               <div className="w-full max-w-xs bg-slate-900 h-full p-5 flex flex-col justify-between border-l border-slate-800 shadow-2xl animate-message">
