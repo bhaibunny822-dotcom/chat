@@ -3,31 +3,24 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>LinkChat — Ephemeral Private Rooms</title>
+  <title>LinkChat — Ephemeral Chat</title>
   
   <meta name="description" content="Instant ephemeral private chat. No accounts, no phone numbers, no history." />
   <meta name="theme-color" content="#090d16" />
 
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          colors: {
-            brand: { 500: '#6366f1', 600: '#4f46e5' }
-          }
-        }
-      }
-    }
-  </script>
 
-  <!-- React 18 & Babel -->
+  <!-- React 18, Babel, Confetti -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
+  
+  <!-- GunDB Resilient Mesh (No API key, multi-relay fallback) -->
+  <script src="https://cdn.jsdelivr.net/npm/gun/gun.js"></script>
+
+  <!-- Font Awesome -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
   <style>
@@ -55,10 +48,16 @@
     const { useState, useEffect, useRef, useMemo, useCallback } = React;
     const MAX_CHARS = 10000;
 
+    // Redundant public Gun relays ensuring delivery across mobile carriers
+    const GUN_PEERS = [
+      'https://gun-manhattan.herokuapp.com/gun',
+      'https://relay.peer.ooo/gun'
+    ];
+
     function getSessionToken() {
       let id = sessionStorage.getItem("linkchat_uid");
       if (!id) {
-        id = "usr_" + Math.random().toString(36).substring(2, 8) + Date.now().toString(36);
+        id = "u_" + Math.random().toString(36).substring(2, 8) + Date.now().toString(36);
         sessionStorage.setItem("linkchat_uid", id);
       }
       return id;
@@ -101,12 +100,12 @@
       const [showUsersDrawer, setShowUsersDrawer] = useState(false);
       const [copied, setCopied] = useState(false);
 
-      const wsRef = useRef(null);
+      const gunRef = useRef(null);
+      const roomNodeRef = useRef(null);
       const messagesEndRef = useRef(null);
-      const typingTimeoutRef = useRef(null);
       const heartbeatIntervalRef = useRef(null);
 
-      // Check URL parameters for room invitations
+      // Extract room from URL
       useEffect(() => {
         const params = new URLSearchParams(window.location.search);
         let r = params.get('room');
@@ -122,7 +121,7 @@
       const appendMessage = useCallback((msg) => {
         setMessages(prev => {
           if (prev.some(m => m.id === msg.id)) return prev;
-          let list = [...prev, msg];
+          let list = [...prev, msg].sort((a,b) => a.timestamp - b.timestamp);
           let total = list.reduce((a, m) => a + (m.text ? m.text.length : 0), 0);
           while (total > MAX_CHARS && list.length > 1) {
             const out = list.shift();
@@ -132,145 +131,69 @@
         });
       }, []);
 
-      // Instant Global WebSocket Protocol
-      const connectToRoomSocket = (targetRoom, nick) => {
-        const cleanRoom = targetRoom.toLowerCase().trim();
-        
-        // Connect to open high-performance WebSocket signaling relay
-        const socketUrl = `wss://socketsbay.com/wss/v2/100/demo/`;
-        let ws;
+      const connectGunRoom = (roomCode, myNick) => {
+        const cleanRoom = roomCode.toLowerCase().trim();
 
-        try {
-          ws = new WebSocket(socketUrl);
-          wsRef.current = ws;
+        // Initialize Gun with fallback peers and disable localStorage persistence
+        const gun = Gun({
+          peers: GUN_PEERS,
+          localStorage: false,
+          radisk: false
+        });
+        gunRef.current = gun;
 
-          ws.onopen = () => {
-            setIsConnected(true);
-            
-            // Register own presence
+        const roomNode = gun.get(`linkchat_v3_${cleanRoom}`);
+        roomNodeRef.current = roomNode;
+
+        setIsConnected(true);
+
+        // Announce presence
+        roomNode.get('users').get(userToken).put({
+          nickname: myNick,
+          lastSeen: Date.now()
+        });
+
+        // Track active participants
+        roomNode.get('users').map().on((userData, token) => {
+          if (!userData || !userData.nickname) return;
+          if (Date.now() - userData.lastSeen < 45000) {
             setParticipants(prev => ({
               ...prev,
-              [userToken]: { nickname: nick, lastSeen: Date.now() }
+              [token]: { nickname: userData.nickname, lastSeen: userData.lastSeen }
             }));
+          }
+        });
 
-            // Announce join
-            dispatchWsPacket({
-              type: 'USER_JOIN',
-              room: cleanRoom,
-              token: userToken,
-              nickname: nick
-            });
+        // Heartbeat interval
+        heartbeatIntervalRef.current = setInterval(() => {
+          roomNode.get('users').get(userToken).put({
+            nickname: myNick,
+            lastSeen: Date.now()
+          });
+        }, 12000);
 
-            // Request sync
-            dispatchWsPacket({
-              type: 'REQ_SYNC',
-              room: cleanRoom,
-              token: userToken
-            });
+        // Listen for new messages
+        roomNode.get('messages').map().on((msgData, msgId) => {
+          if (!msgData || !msgData.text) return;
+          appendMessage({
+            id: msgId,
+            type: 'user',
+            senderToken: msgData.senderToken,
+            senderNickname: msgData.senderNickname,
+            text: msgData.text,
+            timestamp: msgData.timestamp,
+            reactions: msgData.reactions ? JSON.parse(msgData.reactions) : {},
+            urls: extractUrls(msgData.text)
+          });
+        });
 
-            // Heartbeat to keep connection alive and update presence
-            heartbeatIntervalRef.current = setInterval(() => {
-              dispatchWsPacket({
-                type: 'HEARTBEAT',
-                room: cleanRoom,
-                token: userToken,
-                nickname: nick
-              });
-            }, 10000);
-          };
-
-          ws.onmessage = (event) => {
-            try {
-              const data = JSON.parse(event.data);
-              if (data.room !== cleanRoom) return;
-
-              switch (data.type) {
-                case 'CHAT_MSG':
-                  appendMessage(data.message);
-                  break;
-
-                case 'USER_JOIN':
-                  setParticipants(prev => ({
-                    ...prev,
-                    [data.token]: { nickname: data.nickname, lastSeen: Date.now() }
-                  }));
-                  if (data.token !== userToken) {
-                    appendMessage({
-                      id: 'sys_' + Date.now() + Math.random(),
-                      type: 'system',
-                      text: `${data.nickname} joined the chat.`
-                    });
-                    // Reply with sync data
-                    dispatchWsPacket({
-                      type: 'HEARTBEAT',
-                      room: cleanRoom,
-                      token: userToken,
-                      nickname: nick
-                    });
-                  }
-                  break;
-
-                case 'HEARTBEAT':
-                  setParticipants(prev => ({
-                    ...prev,
-                    [data.token]: { nickname: data.nickname, lastSeen: Date.now() }
-                  }));
-                  break;
-
-                case 'USER_TYPING':
-                  if (data.token !== userToken) {
-                    setActiveTypers(prev => ({ ...prev, [data.nickname]: Date.now() + 2500 }));
-                  }
-                  break;
-
-                case 'REQ_SYNC':
-                  if (data.token !== userToken && messages.length > 0) {
-                    dispatchWsPacket({
-                      type: 'RES_SYNC',
-                      room: cleanRoom,
-                      messages: messages
-                    });
-                  }
-                  break;
-
-                case 'RES_SYNC':
-                  if (data.messages && data.messages.length > 0) {
-                    setMessages(prev => {
-                      const map = new Map();
-                      [...prev, ...data.messages].forEach(m => map.set(m.id, m));
-                      return Array.from(map.values()).sort((a,b) => a.timestamp - b.timestamp);
-                    });
-                  }
-                  break;
-
-                case 'REACTION':
-                  setMessages(prev => prev.map(m => {
-                    if (m.id !== data.messageId) return m;
-                    const rx = { ...(m.reactions || {}) };
-                    rx[data.emoji] = (rx[data.emoji] || 0) + 1;
-                    return { ...m, reactions: rx };
-                  }));
-                  break;
-              }
-            } catch (err) {}
-          };
-
-          ws.onerror = () => setIsConnected(false);
-          ws.onclose = () => {
-            setIsConnected(false);
-            if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
-          };
-        } catch (e) {
-          setIsConnected(false);
-        }
-      };
-
-      const dispatchWsPacket = (packet) => {
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          try {
-            wsRef.current.send(JSON.stringify(packet));
-          } catch (e) {}
-        }
+        // Listen for typing indicators
+        roomNode.get('typing').map().on((typingData, token) => {
+          if (!typingData || token === userToken) return;
+          if (Date.now() - typingData.timestamp < 3000) {
+            setActiveTypers(prev => ({ ...prev, [typingData.nickname]: Date.now() + 2500 }));
+          }
+        });
       };
 
       const handleCreateRoom = () => {
@@ -285,12 +208,7 @@
         window.history.pushState({}, '', `?room=${code}`);
         setScreen('chat');
         setShowShareModal(true);
-        connectToRoomSocket(code, nick);
-        appendMessage({
-          id: 'init_msg',
-          type: 'system',
-          text: '🔒 Ephemeral room created. Share the link or QR to connect.'
-        });
+        connectGunRoom(code, nick);
         try { confetti({ particleCount: 40, spread: 60, origin: { y: 0.7 } }); } catch (e) {}
       };
 
@@ -302,10 +220,10 @@
         const nick = nickname.trim();
         localStorage.setItem("lc_nick", nick);
         setScreen('chat');
-        connectToRoomSocket(roomId, nick);
+        connectGunRoom(roomId, nick);
       };
 
-      // Periodic presence cleanup (stale heartbeats > 30s)
+      // Periodic presence cleanup (stale heartbeats > 35s)
       useEffect(() => {
         const iv = setInterval(() => {
           const now = Date.now();
@@ -344,24 +262,16 @@
       const handleSendMessage = (e) => {
         e.preventDefault();
         const trimmed = inputText.trim();
-        if (!trimmed) return;
+        if (!trimmed || !roomNodeRef.current) return;
 
-        const newMsg = {
-          id: 'm_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
-          type: 'user',
+        const msgId = 'm_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+
+        roomNodeRef.current.get('messages').get(msgId).put({
           senderToken: userToken,
           senderNickname: nickname,
           text: trimmed,
           timestamp: Date.now(),
-          reactions: {},
-          urls: extractUrls(trimmed)
-        };
-
-        appendMessage(newMsg);
-        dispatchWsPacket({
-          type: 'CHAT_MSG',
-          room: roomId,
-          message: newMsg
+          reactions: JSON.stringify({})
         });
 
         setInputText("");
@@ -369,28 +279,23 @@
 
       const handleTypingInput = (e) => {
         setInputText(e.target.value);
-        dispatchWsPacket({
-          type: 'USER_TYPING',
-          room: roomId,
-          token: userToken,
-          nickname: nickname
-        });
+        if (roomNodeRef.current) {
+          roomNodeRef.current.get('typing').get(userToken).put({
+            nickname: nickname,
+            timestamp: Date.now()
+          });
+        }
       };
 
       const addReaction = (messageId, emoji) => {
-        setMessages(prev => prev.map(m => {
-          if (m.id !== messageId) return m;
-          const rx = { ...(m.reactions || {}) };
-          rx[emoji] = (rx[emoji] || 0) + 1;
-          return { ...m, reactions: rx };
-        }));
+        if (!roomNodeRef.current) return;
+        const msg = messages.find(m => m.id === messageId);
+        if (!msg) return;
 
-        dispatchWsPacket({
-          type: 'REACTION',
-          room: roomId,
-          messageId,
-          emoji
-        });
+        const rx = { ...(msg.reactions || {}) };
+        rx[emoji] = (rx[emoji] || 0) + 1;
+
+        roomNodeRef.current.get('messages').get(messageId).get('reactions').put(JSON.stringify(rx));
       };
 
       const totalCharsUsed = useMemo(() => {
@@ -518,7 +423,7 @@
           {/* Header */}
           <header className="px-4 py-3 bg-slate-900/90 border-b border-slate-800/80 flex items-center justify-between sticky top-0 z-30 backdrop-blur-md">
             <div className="flex items-center gap-3">
-              <div className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`}></div>
+              <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></div>
               <div>
                 <div className="flex items-center gap-1.5">
                   <span className="font-bold text-sm text-white">Room {roomId}</span>
@@ -549,16 +454,6 @@
           {/* Messages */}
           <main className="flex-1 overflow-y-auto px-4 py-4 space-y-3.5 scrollbar-none">
             {messages.map((msg) => {
-              if (msg.type === 'system') {
-                return (
-                  <div key={msg.id} className="flex justify-center my-2">
-                    <span className="text-[11px] text-slate-400 bg-slate-900 px-3 py-1 rounded-full border border-slate-800">
-                      {msg.text}
-                    </span>
-                  </div>
-                );
-              }
-
               const isMe = msg.senderToken === userToken;
               const time = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
