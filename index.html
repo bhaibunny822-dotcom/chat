@@ -3,22 +3,31 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>LinkChat — Chat Without Accounts</title>
+  <title>LinkChat — Ephemeral Private Rooms</title>
   
   <meta name="description" content="Instant ephemeral private chat. No accounts, no phone numbers, no history." />
   <meta name="theme-color" content="#090d16" />
 
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: { 500: '#6366f1', 600: '#4f46e5' }
+          }
+        }
+      }
+    }
+  </script>
 
-  <!-- React 18, Babel, Confetti -->
+  <!-- React 18 & Babel -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
-  
-  <!-- Ably Global Realtime WebSocket Network -->
-  <script src="https://cdn.ably.com/lib/ably.min-1.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
   <style>
@@ -43,17 +52,14 @@
   <div id="root"></div>
 
   <script type="text/babel">
-    const { useState, useEffect, useRef, useMemo } = React;
+    const { useState, useEffect, useRef, useMemo, useCallback } = React;
     const MAX_CHARS = 10000;
-    
-    // Global Multi-Region WebSockets Key (Active & Unrestricted)
-    const ABLY_KEY = "WnU61g.K3L2rA:qL8Xb9N0j1V2C3M4P5R6S7T8U9V0W1X2Y3Z4A5B6C7D";
 
     function getSessionToken() {
-      let id = sessionStorage.getItem("linkchat_token");
+      let id = sessionStorage.getItem("linkchat_uid");
       if (!id) {
-        id = "u_" + Math.random().toString(36).substring(2, 9);
-        sessionStorage.setItem("linkchat_token", id);
+        id = "usr_" + Math.random().toString(36).substring(2, 8) + Date.now().toString(36);
+        sessionStorage.setItem("linkchat_uid", id);
       }
       return id;
     }
@@ -65,11 +71,17 @@
       return res;
     }
 
-    function QRCodeRenderer({ text, size = 160 }) {
+    function extractUrls(text) {
+      if (!text) return [];
+      const matches = text.match(/(https?:\/\/[^\s]+)/gi);
+      return matches ? Array.from(new Set(matches)) : [];
+    }
+
+    function QRCodeRenderer({ text, size = 150 }) {
       const src = `https://api.qrserver.com/v1/create-qr-code/?size=${size * 2}x${size * 2}&data=${encodeURIComponent(text)}&color=090d16&bgcolor=ffffff&qzone=1`;
       return (
         <div className="p-3 bg-white rounded-2xl shadow-xl inline-block border border-slate-700">
-          <img src={src} alt="Room QR" width={size} height={size} className="rounded-lg block object-contain" />
+          <img src={src} alt="Room QR Code" width={size} height={size} className="rounded-lg block object-contain" />
         </div>
       );
     }
@@ -80,20 +92,21 @@
       const [nickname, setNickname] = useState(() => localStorage.getItem("lc_nick") || "");
       const [roomId, setRoomId] = useState("");
       const [isConnected, setIsConnected] = useState(false);
-      const [activeUserCount, setActiveUserCount] = useState(1);
+      const [participants, setParticipants] = useState({});
       
       const [messages, setMessages] = useState([]);
       const [inputText, setInputText] = useState("");
       const [activeTypers, setActiveTypers] = useState({});
       const [showShareModal, setShowShareModal] = useState(false);
+      const [showUsersDrawer, setShowUsersDrawer] = useState(false);
       const [copied, setCopied] = useState(false);
 
-      const channelRef = useRef(null);
-      const ablyRef = useRef(null);
+      const wsRef = useRef(null);
       const messagesEndRef = useRef(null);
       const typingTimeoutRef = useRef(null);
+      const heartbeatIntervalRef = useRef(null);
 
-      // Detect room parameter
+      // Check URL parameters for room invitations
       useEffect(() => {
         const params = new URLSearchParams(window.location.search);
         let r = params.get('room');
@@ -106,7 +119,7 @@
         }
       }, []);
 
-      const appendMessage = (msg) => {
+      const appendMessage = useCallback((msg) => {
         setMessages(prev => {
           if (prev.some(m => m.id === msg.id)) return prev;
           let list = [...prev, msg];
@@ -117,76 +130,147 @@
           }
           return list;
         });
+      }, []);
+
+      // Instant Global WebSocket Protocol
+      const connectToRoomSocket = (targetRoom, nick) => {
+        const cleanRoom = targetRoom.toLowerCase().trim();
+        
+        // Connect to open high-performance WebSocket signaling relay
+        const socketUrl = `wss://socketsbay.com/wss/v2/100/demo/`;
+        let ws;
+
+        try {
+          ws = new WebSocket(socketUrl);
+          wsRef.current = ws;
+
+          ws.onopen = () => {
+            setIsConnected(true);
+            
+            // Register own presence
+            setParticipants(prev => ({
+              ...prev,
+              [userToken]: { nickname: nick, lastSeen: Date.now() }
+            }));
+
+            // Announce join
+            dispatchWsPacket({
+              type: 'USER_JOIN',
+              room: cleanRoom,
+              token: userToken,
+              nickname: nick
+            });
+
+            // Request sync
+            dispatchWsPacket({
+              type: 'REQ_SYNC',
+              room: cleanRoom,
+              token: userToken
+            });
+
+            // Heartbeat to keep connection alive and update presence
+            heartbeatIntervalRef.current = setInterval(() => {
+              dispatchWsPacket({
+                type: 'HEARTBEAT',
+                room: cleanRoom,
+                token: userToken,
+                nickname: nick
+              });
+            }, 10000);
+          };
+
+          ws.onmessage = (event) => {
+            try {
+              const data = JSON.parse(event.data);
+              if (data.room !== cleanRoom) return;
+
+              switch (data.type) {
+                case 'CHAT_MSG':
+                  appendMessage(data.message);
+                  break;
+
+                case 'USER_JOIN':
+                  setParticipants(prev => ({
+                    ...prev,
+                    [data.token]: { nickname: data.nickname, lastSeen: Date.now() }
+                  }));
+                  if (data.token !== userToken) {
+                    appendMessage({
+                      id: 'sys_' + Date.now() + Math.random(),
+                      type: 'system',
+                      text: `${data.nickname} joined the chat.`
+                    });
+                    // Reply with sync data
+                    dispatchWsPacket({
+                      type: 'HEARTBEAT',
+                      room: cleanRoom,
+                      token: userToken,
+                      nickname: nick
+                    });
+                  }
+                  break;
+
+                case 'HEARTBEAT':
+                  setParticipants(prev => ({
+                    ...prev,
+                    [data.token]: { nickname: data.nickname, lastSeen: Date.now() }
+                  }));
+                  break;
+
+                case 'USER_TYPING':
+                  if (data.token !== userToken) {
+                    setActiveTypers(prev => ({ ...prev, [data.nickname]: Date.now() + 2500 }));
+                  }
+                  break;
+
+                case 'REQ_SYNC':
+                  if (data.token !== userToken && messages.length > 0) {
+                    dispatchWsPacket({
+                      type: 'RES_SYNC',
+                      room: cleanRoom,
+                      messages: messages
+                    });
+                  }
+                  break;
+
+                case 'RES_SYNC':
+                  if (data.messages && data.messages.length > 0) {
+                    setMessages(prev => {
+                      const map = new Map();
+                      [...prev, ...data.messages].forEach(m => map.set(m.id, m));
+                      return Array.from(map.values()).sort((a,b) => a.timestamp - b.timestamp);
+                    });
+                  }
+                  break;
+
+                case 'REACTION':
+                  setMessages(prev => prev.map(m => {
+                    if (m.id !== data.messageId) return m;
+                    const rx = { ...(m.reactions || {}) };
+                    rx[data.emoji] = (rx[data.emoji] || 0) + 1;
+                    return { ...m, reactions: rx };
+                  }));
+                  break;
+              }
+            } catch (err) {}
+          };
+
+          ws.onerror = () => setIsConnected(false);
+          ws.onclose = () => {
+            setIsConnected(false);
+            if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
+          };
+        } catch (e) {
+          setIsConnected(false);
+        }
       };
 
-      const startAblyConnection = (targetRoom, nick) => {
-        const cleanRoom = targetRoom.toLowerCase().trim();
-
-        // Connect via standard persistent WSS (bypasses all carrier NATs & browser restrictions)
-        const ably = new Ably.Realtime({
-          key: ABLY_KEY,
-          clientId: `${nick}_${userToken}`
-        });
-        ablyRef.current = ably;
-
-        const channel = ably.channels.get(`linkchat-room-${cleanRoom}`);
-        channelRef.current = channel;
-
-        ably.connection.on('connected', () => {
-          setIsConnected(true);
-          
-          // Enter room presence
-          channel.presence.enter({ nickname: nick, token: userToken });
-
-          // Announce join
-          channel.publish('user_joined', {
-            token: userToken,
-            nickname: nick
-          });
-        });
-
-        // Track live presence count
-        channel.presence.subscribe(() => {
-          channel.presence.get((err, members) => {
-            if (!err && members) {
-              setActiveUserCount(Math.max(1, members.length));
-            }
-          });
-        });
-
-        // Listen for all messages
-        channel.subscribe('chat_msg', (message) => {
-          appendMessage(message.data);
-        });
-
-        channel.subscribe('user_joined', (message) => {
-          if (message.data.token !== userToken) {
-            appendMessage({
-              id: 'sys_' + Date.now() + Math.random(),
-              type: 'system',
-              text: `${message.data.nickname} joined the chat.`
-            });
-          }
-        });
-
-        channel.subscribe('user_typing', (message) => {
-          if (message.data.token !== userToken) {
-            setActiveTypers(prev => ({ ...prev, [message.data.nickname]: Date.now() + 2500 }));
-          }
-        });
-
-        channel.subscribe('reaction', (message) => {
-          const { messageId, emoji } = message.data;
-          setMessages(prev => prev.map(m => {
-            if (m.id !== messageId) return m;
-            const rx = { ...(m.reactions || {}) };
-            rx[emoji] = (rx[emoji] || 0) + 1;
-            return { ...m, reactions: rx };
-          }));
-        });
-
-        ably.connection.on('disconnected', () => setIsConnected(false));
-        ably.connection.on('failed', () => setIsConnected(false));
+      const dispatchWsPacket = (packet) => {
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          try {
+            wsRef.current.send(JSON.stringify(packet));
+          } catch (e) {}
+        }
       };
 
       const handleCreateRoom = () => {
@@ -201,11 +285,11 @@
         window.history.pushState({}, '', `?room=${code}`);
         setScreen('chat');
         setShowShareModal(true);
-        startAblyConnection(code, nick);
+        connectToRoomSocket(code, nick);
         appendMessage({
           id: 'init_msg',
           type: 'system',
-          text: '🔒 Ephemeral room activated. Share the link or QR to chat.'
+          text: '🔒 Ephemeral room created. Share the link or QR to connect.'
         });
         try { confetti({ particleCount: 40, spread: 60, origin: { y: 0.7 } }); } catch (e) {}
       };
@@ -218,13 +302,27 @@
         const nick = nickname.trim();
         localStorage.setItem("lc_nick", nick);
         setScreen('chat');
-        startAblyConnection(roomId, nick);
+        connectToRoomSocket(roomId, nick);
       };
 
-      // Typing decay cleanup
+      // Periodic presence cleanup (stale heartbeats > 30s)
       useEffect(() => {
         const iv = setInterval(() => {
           const now = Date.now();
+          setParticipants(prev => {
+            let changed = false;
+            const updated = {};
+            for (const [token, data] of Object.entries(prev)) {
+              if (token === userToken || (now - data.lastSeen < 35000)) {
+                updated[token] = data;
+              } else {
+                changed = true;
+              }
+            }
+            return changed ? updated : prev;
+          });
+
+          // Typing decay
           setActiveTypers(prev => {
             let changed = false;
             const updated = {};
@@ -234,9 +332,10 @@
             }
             return changed ? updated : prev;
           });
-        }, 1000);
+        }, 1500);
+
         return () => clearInterval(iv);
-      }, []);
+      }, [userToken]);
 
       useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -245,7 +344,7 @@
       const handleSendMessage = (e) => {
         e.preventDefault();
         const trimmed = inputText.trim();
-        if (!trimmed || !channelRef.current) return;
+        if (!trimmed) return;
 
         const newMsg = {
           id: 'm_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
@@ -254,27 +353,41 @@
           senderNickname: nickname,
           text: trimmed,
           timestamp: Date.now(),
-          reactions: {}
+          reactions: {},
+          urls: extractUrls(trimmed)
         };
 
-        // Real-time broadcast
-        channelRef.current.publish('chat_msg', newMsg);
+        appendMessage(newMsg);
+        dispatchWsPacket({
+          type: 'CHAT_MSG',
+          room: roomId,
+          message: newMsg
+        });
+
         setInputText("");
       };
 
       const handleTypingInput = (e) => {
         setInputText(e.target.value);
-        if (channelRef.current) {
-          channelRef.current.publish('user_typing', {
-            token: userToken,
-            nickname: nickname
-          });
-        }
+        dispatchWsPacket({
+          type: 'USER_TYPING',
+          room: roomId,
+          token: userToken,
+          nickname: nickname
+        });
       };
 
       const addReaction = (messageId, emoji) => {
-        if (!channelRef.current) return;
-        channelRef.current.publish('reaction', {
+        setMessages(prev => prev.map(m => {
+          if (m.id !== messageId) return m;
+          const rx = { ...(m.reactions || {}) };
+          rx[emoji] = (rx[emoji] || 0) + 1;
+          return { ...m, reactions: rx };
+        }));
+
+        dispatchWsPacket({
+          type: 'REACTION',
+          room: roomId,
           messageId,
           emoji
         });
@@ -283,6 +396,10 @@
       const totalCharsUsed = useMemo(() => {
         return messages.reduce((a, m) => a + (m.text ? m.text.length : 0), 0);
       }, [messages]);
+
+      const participantCount = useMemo(() => {
+        return Math.max(1, Object.keys(participants).length);
+      }, [participants]);
 
       const inviteUrl = `${window.location.origin}${window.location.pathname}?room=${roomId}`;
 
@@ -406,8 +523,14 @@
                 <div className="flex items-center gap-1.5">
                   <span className="font-bold text-sm text-white">Room {roomId}</span>
                 </div>
-                <div className="text-[11px] text-slate-400">
-                  {isConnected ? `${activeUserCount} online` : 'Connecting...'} • {totalCharsUsed}/10k chars
+                <div 
+                  onClick={() => setShowUsersDrawer(true)}
+                  className="text-[11px] text-slate-400 cursor-pointer hover:text-indigo-400 transition-colors flex items-center gap-1"
+                >
+                  <span className="font-semibold text-emerald-400">{participantCount} online</span>
+                  <span>•</span>
+                  <span>{totalCharsUsed}/10k chars</span>
+                  <i className="fa-solid fa-angle-right text-[9px] ml-0.5"></i>
                 </div>
               </div>
             </div>
@@ -451,6 +574,25 @@
                   }`}>
                     <div className="break-words select-text">{msg.text}</div>
 
+                    {/* Rich Media Cards */}
+                    {msg.urls && msg.urls.length > 0 && (
+                      <div className="mt-2 space-y-1.5">
+                        {msg.urls.map((u, i) => (
+                          <a 
+                            key={i} 
+                            href={u} 
+                            target="_blank" 
+                            rel="noopener noreferrer" 
+                            className="block p-2 rounded-xl bg-black/30 border border-white/10 text-xs text-indigo-300 hover:text-white truncate"
+                          >
+                            <i className="fa-solid fa-arrow-up-right-from-square mr-1 text-[10px]"></i>
+                            {u}
+                          </a>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Reactions display */}
                     {msg.reactions && Object.keys(msg.reactions).length > 0 && (
                       <div className="flex flex-wrap gap-1 mt-1.5 pt-1 border-t border-white/10">
                         {Object.entries(msg.reactions).map(([emoji, count]) => (
@@ -484,7 +626,7 @@
             <form onSubmit={handleSendMessage} className="flex items-center gap-2">
               <input
                 type="text"
-                placeholder="Type a message..."
+                placeholder="Type a message or drop a link..."
                 value={inputText}
                 onChange={handleTypingInput}
                 className="flex-1 bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition-all"
@@ -499,6 +641,36 @@
             </form>
           </footer>
 
+          {/* Participants Drawer */}
+          {showUsersDrawer && (
+            <div className="fixed inset-0 z-50 bg-black/75 flex justify-end backdrop-blur-sm">
+              <div className="w-full max-w-xs bg-slate-900 h-full p-5 flex flex-col justify-between border-l border-slate-800 shadow-2xl">
+                <div>
+                  <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-4">
+                    <h3 className="font-bold text-white text-base">Participants ({participantCount})</h3>
+                    <button onClick={() => setShowUsersDrawer(false)} className="p-1 rounded-lg text-slate-400 hover:text-white">✕</button>
+                  </div>
+                  <div className="space-y-2">
+                    {Object.entries(participants).map(([tok, data]) => (
+                      <div key={tok} className="flex items-center justify-between p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                        <span className="text-sm font-medium text-slate-200">
+                          {data.nickname} {tok === userToken ? '(You)' : ''}
+                        </span>
+                        <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowUsersDrawer(false)}
+                  className="w-full py-2.5 rounded-xl bg-slate-800 text-slate-300 font-semibold text-xs"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Share Modal */}
           {showShareModal && (
             <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4 backdrop-blur-sm">
@@ -511,7 +683,7 @@
                 </button>
 
                 <h3 className="text-lg font-bold text-white mb-1">Invite Partner</h3>
-                <p className="text-xs text-slate-400 mb-5">Scan this QR code with any smartphone:</p>
+                <p className="text-xs text-slate-400 mb-5">Scan this QR code with any smartphone camera:</p>
 
                 <div className="flex justify-center mb-5">
                   <QRCodeRenderer text={inviteUrl} size={150} />
