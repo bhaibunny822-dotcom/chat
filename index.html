@@ -10,25 +10,15 @@
 
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          colors: {
-            brand: { 500: '#6366f1', 600: '#4f46e5' }
-          }
-        }
-      }
-    }
-  </script>
 
-  <!-- React 18, Babel, Confetti & PeerJS -->
+  <!-- React 18 & ReactDOM -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
-  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  
+  <!-- Global MQTT WebSocket Engine (Works inside Instagram & on Mobile 4G/5G) -->
+  <script src="https://unpkg.com/mqtt@5.3.5/dist/mqtt.min.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
   <style>
@@ -55,6 +45,9 @@
   <script type="text/babel">
     const { useState, useEffect, useRef, useMemo } = React;
     const MAX_CHARS = 10000;
+    
+    // Enterprise public SSL WebSocket brokers for instant cross-country messaging
+    const MQTT_BROKER = "wss://broker.hivemq.com:8884/mqtt";
 
     function getSessionToken() {
       let id = sessionStorage.getItem("linkchat_token");
@@ -86,9 +79,8 @@
       const [userToken] = useState(getSessionToken);
       const [nickname, setNickname] = useState(() => localStorage.getItem("lc_nick") || "");
       const [roomId, setRoomId] = useState("");
-      const [isHost, setIsHost] = useState(false);
-      const [peerConnected, setPeerConnected] = useState(false);
-      const [peerCount, setPeerCount] = useState(1);
+      const [isConnected, setIsConnected] = useState(false);
+      const [participants, setParticipants] = useState({});
       
       const [messages, setMessages] = useState([]);
       const [inputText, setInputText] = useState("");
@@ -96,28 +88,22 @@
       const [showShareModal, setShowShareModal] = useState(false);
       const [copied, setCopied] = useState(false);
 
-      const peerRef = useRef(null);
-      const connectionsRef = useRef(new Map());
+      const clientRef = useRef(null);
       const messagesEndRef = useRef(null);
       const typingTimeoutRef = useRef(null);
 
-      // Check query/hash parameters on load
+      // Detect room from query or hash parameter
       useEffect(() => {
         const params = new URLSearchParams(window.location.search);
-        let r = params.get('room') || (window.location.hash.includes('room=') ? new URLSearchParams(window.location.hash.split('?')[1]).get('room') : null);
+        let r = params.get('room');
+        if (!r && window.location.hash.includes('room=')) {
+          r = new URLSearchParams(window.location.hash.split('?')[1] || window.location.hash.replace('#', '')).get('room');
+        }
         if (r) {
           setRoomId(r);
           setScreen('join');
         }
       }, []);
-
-      const broadcast = (data) => {
-        connectionsRef.current.forEach((conn) => {
-          if (conn.open) {
-            try { conn.send(data); } catch (e) {}
-          }
-        });
-      };
 
       const appendMessage = (msg) => {
         setMessages(prev => {
@@ -132,157 +118,129 @@
         });
       };
 
-      const setupConnectionListeners = (conn) => {
-        conn.on('open', () => {
-          connectionsRef.current.set(conn.peer, conn);
-          setPeerConnected(true);
-          setPeerCount(connectionsRef.current.size + 1);
+      const startChatConnection = (targetRoom, nick) => {
+        const cleanRoom = targetRoom.toLowerCase().trim();
+        const topic = `linkchat/rooms/${cleanRoom}/mesh`;
 
-          // Exchange user greeting
-          conn.send({
+        // Connect over standard HTTPS/WSS (Bypasses all mobile carrier & Instagram firewalls)
+        const client = mqtt.connect(MQTT_BROKER, {
+          clientId: `lc_${userToken}_${Math.random().toString(16).substring(2, 8)}`,
+          clean: true,
+          reconnectPeriod: 2000,
+          connectTimeout: 10000
+        });
+
+        clientRef.current = client;
+
+        client.on('connect', () => {
+          setIsConnected(true);
+          client.subscribe(topic, { qos: 1 });
+
+          // Broadcast join event
+          const joinPacket = {
             type: 'USER_JOINED',
-            nickname: nickname || "Guest",
-            token: userToken
-          });
+            token: userToken,
+            nickname: nick
+          };
+          client.publish(topic, JSON.stringify(joinPacket));
 
-          // Host syncs state to newcomers
-          if (isHost) {
-            conn.send({
-              type: 'SYNC_HISTORY',
-              messages: messages
-            });
-          }
+          // Ping existing users for room chat history
+          client.publish(topic, JSON.stringify({ type: 'REQ_SYNC', token: userToken }));
         });
 
-        conn.on('data', (packet) => {
-          if (!packet || typeof packet !== 'object') return;
+        client.on('message', (t, payload) => {
+          try {
+            const packet = JSON.parse(payload.toString());
+            if (!packet || typeof packet !== 'object') return;
 
-          switch (packet.type) {
-            case 'CHAT_MSG':
-              appendMessage(packet.message);
-              // Host relays incoming messages to all other connected peers
-              if (isHost) {
-                connectionsRef.current.forEach((c, pid) => {
-                  if (pid !== conn.peer && c.open) {
-                    try { c.send(packet); } catch (e) {}
-                  }
-                });
-              }
-              break;
+            switch (packet.type) {
+              case 'CHAT_MSG':
+                appendMessage(packet.message);
+                break;
 
-            case 'USER_JOINED':
-              appendMessage({
-                id: 'sys_' + Date.now() + Math.random(),
-                type: 'system',
-                text: `${packet.nickname} joined the chat.`
-              });
-              break;
+              case 'USER_JOINED':
+                setParticipants(prev => ({ ...prev, [packet.token]: packet.nickname }));
+                if (packet.token !== userToken) {
+                  appendMessage({
+                    id: 'sys_' + Date.now() + Math.random(),
+                    type: 'system',
+                    text: `${packet.nickname} joined the chat.`
+                  });
+                }
+                break;
 
-            case 'USER_TYPING':
-              setActiveTypers(prev => ({ ...prev, [packet.nickname]: Date.now() + 2500 }));
-              break;
+              case 'USER_TYPING':
+                if (packet.token !== userToken) {
+                  setActiveTypers(prev => ({ ...prev, [packet.nickname]: Date.now() + 2500 }));
+                }
+                break;
 
-            case 'SYNC_HISTORY':
-              if (packet.messages && packet.messages.length > 0) {
-                setMessages(packet.messages);
-              }
-              break;
+              case 'REQ_SYNC':
+                // Someone joined; send our current messages if we have any
+                if (packet.token !== userToken && messages.length > 0) {
+                  client.publish(topic, JSON.stringify({
+                    type: 'RES_SYNC',
+                    messages: messages
+                  }));
+                }
+                break;
 
-            case 'REACTION':
-              setMessages(prev => prev.map(m => {
-                if (m.id !== packet.messageId) return m;
-                const rx = { ...(m.reactions || {}) };
-                rx[packet.emoji] = (rx[packet.emoji] || 0) + 1;
-                return { ...m, reactions: rx };
-              }));
-              break;
-          }
+              case 'RES_SYNC':
+                if (packet.messages && packet.messages.length > 0) {
+                  setMessages(prev => {
+                    const map = new Map();
+                    [...prev, ...packet.messages].forEach(m => map.set(m.id, m));
+                    return Array.from(map.values()).sort((a,b) => a.timestamp - b.timestamp);
+                  });
+                }
+                break;
+
+              case 'REACTION':
+                setMessages(prev => prev.map(m => {
+                  if (m.id !== packet.messageId) return m;
+                  const rx = { ...(m.reactions || {}) };
+                  rx[packet.emoji] = (rx[packet.emoji] || 0) + 1;
+                  return { ...m, reactions: rx };
+                }));
+                break;
+            }
+          } catch (e) {}
         });
 
-        conn.on('close', () => {
-          connectionsRef.current.delete(conn.peer);
-          setPeerCount(connectionsRef.current.size + 1);
-        });
-
-        conn.on('error', () => {
-          connectionsRef.current.delete(conn.peer);
-        });
+        client.on('offline', () => setIsConnected(false));
+        client.on('error', () => setIsConnected(false));
       };
 
-      // 1. Host creates room
       const handleCreateRoom = () => {
+        if (!nickname.trim()) {
+          alert("Please enter a temporary nickname.");
+          return;
+        }
+        const nick = nickname.trim();
+        localStorage.setItem("lc_nick", nick);
+        const code = generateRoomCode();
+        setRoomId(code);
+        window.history.pushState({}, '', `?room=${code}`);
+        setScreen('chat');
+        setShowShareModal(true);
+        startChatConnection(code, nick);
+        appendMessage({
+          id: 'init_msg',
+          type: 'system',
+          text: '🔒 Private room created. Send the link or QR to connect.'
+        });
+        try { confetti({ particleCount: 40, spread: 60, origin: { y: 0.7 } }); } catch (e) {}
+      };
+
+      const handleJoinRoom = () => {
         if (!nickname.trim()) {
           alert("Please enter a nickname.");
           return;
         }
-        localStorage.setItem("lc_nick", nickname.trim());
-
-        const code = generateRoomCode();
-        setRoomId(code);
-        setIsHost(true);
-
-        const hostPeerId = `linkchat-${code}-host`;
-        const peer = new Peer(hostPeerId);
-        peerRef.current = peer;
-
-        peer.on('open', () => {
-          setPeerConnected(true);
-          window.history.pushState({}, '', `?room=${code}`);
-          setScreen('chat');
-          setShowShareModal(true);
-          appendMessage({
-            id: 'init_msg',
-            type: 'system',
-            text: '🔒 Room initialized. Share the link or QR code to chat.'
-          });
-          try { confetti({ particleCount: 40, spread: 60, origin: { y: 0.7 } }); } catch (e) {}
-        });
-
-        peer.on('connection', (conn) => {
-          setupConnectionListeners(conn);
-        });
-
-        peer.on('error', (err) => {
-          if (err.type === 'unavailable-id') {
-            // Room code collision; regenerate
-            peer.destroy();
-            handleCreateRoom();
-          } else {
-            console.error("PeerJS error:", err);
-          }
-        });
-      };
-
-      // 2. Guest joins room
-      const handleJoinRoom = () => {
-        if (!nickname.trim()) {
-          alert("Please choose a nickname.");
-          return;
-        }
-        localStorage.setItem("lc_nick", nickname.trim());
-
-        const peer = new Peer();
-        peerRef.current = peer;
-
-        peer.on('open', () => {
-          const hostPeerId = `linkchat-${roomId}-host`;
-          const conn = peer.connect(hostPeerId, { reliable: true });
-
-          setupConnectionListeners(conn);
-
-          conn.on('open', () => {
-            setScreen('chat');
-            appendMessage({
-              id: 'init_joined',
-              type: 'system',
-              text: `Joined Room ${roomId}.`
-            });
-          });
-        });
-
-        peer.on('error', (err) => {
-          alert("Could not connect to host. The room may have expired or the host is offline.");
-        });
+        const nick = nickname.trim();
+        localStorage.setItem("lc_nick", nick);
+        setScreen('chat');
+        startChatConnection(roomId, nick);
       };
 
       // Typing decay cleanup
@@ -309,10 +267,10 @@
       const handleSendMessage = (e) => {
         e.preventDefault();
         const trimmed = inputText.trim();
-        if (!trimmed) return;
+        if (!trimmed || !clientRef.current) return;
 
         const newMsg = {
-          id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
+          id: 'm_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
           type: 'user',
           senderToken: userToken,
           senderNickname: nickname,
@@ -321,38 +279,35 @@
           reactions: {}
         };
 
-        appendMessage(newMsg);
-        setInputText("");
-
-        broadcast({
+        const topic = `linkchat/rooms/${roomId.toLowerCase().trim()}/mesh`;
+        clientRef.current.publish(topic, JSON.stringify({
           type: 'CHAT_MSG',
           message: newMsg
-        });
+        }));
 
-        if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+        setInputText("");
       };
 
       const handleTypingInput = (e) => {
         setInputText(e.target.value);
-        broadcast({
-          type: 'USER_TYPING',
-          nickname: nickname
-        });
+        if (clientRef.current) {
+          const topic = `linkchat/rooms/${roomId.toLowerCase().trim()}/mesh`;
+          clientRef.current.publish(topic, JSON.stringify({
+            type: 'USER_TYPING',
+            token: userToken,
+            nickname: nickname
+          }));
+        }
       };
 
       const addReaction = (messageId, emoji) => {
-        setMessages(prev => prev.map(m => {
-          if (m.id !== messageId) return m;
-          const rx = { ...(m.reactions || {}) };
-          rx[emoji] = (rx[emoji] || 0) + 1;
-          return { ...m, reactions: rx };
-        }));
-
-        broadcast({
+        if (!clientRef.current) return;
+        const topic = `linkchat/rooms/${roomId.toLowerCase().trim()}/mesh`;
+        clientRef.current.publish(topic, JSON.stringify({
           type: 'REACTION',
           messageId,
           emoji
-        });
+        }));
       };
 
       const totalCharsUsed = useMemo(() => {
@@ -366,7 +321,7 @@
           try {
             await navigator.share({
               title: "Join my LinkChat",
-              text: "Private ephemeral chat room. No registration needed.",
+              text: "Private ephemeral chat room. Zero registration.",
               url: inviteUrl
             });
           } catch (e) {}
@@ -392,7 +347,7 @@
                 </span>
               </h1>
               <p className="text-slate-400 text-sm leading-relaxed">
-                Create a private room, share the link or QR code, and communicate directly across devices with no persistent database.
+                Instant private room. Works across phones, laptops, Instagram DMs, and cellular data anywhere in the world.
               </p>
             </div>
 
@@ -403,7 +358,7 @@
               <input
                 type="text"
                 maxLength={20}
-                placeholder="e.g. Maverick, Alex"
+                placeholder="e.g. Alex, Maverick"
                 value={nickname}
                 onChange={(e) => setNickname(e.target.value)}
                 className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3.5 text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition-all font-medium mb-5"
@@ -450,7 +405,7 @@
                 type="text"
                 autoFocus
                 maxLength={20}
-                placeholder="Choose your nickname..."
+                placeholder="Enter your nickname..."
                 value={nickname}
                 onChange={(e) => setNickname(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleJoinRoom()}
@@ -476,14 +431,13 @@
           {/* Header */}
           <header className="px-4 py-3 bg-slate-900/90 border-b border-slate-800/80 flex items-center justify-between sticky top-0 z-30 backdrop-blur-md">
             <div className="flex items-center gap-3">
-              <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></div>
+              <div className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`}></div>
               <div>
                 <div className="flex items-center gap-1.5">
                   <span className="font-bold text-sm text-white">Room {roomId}</span>
-                  {isHost && <span className="text-[10px] bg-indigo-500/20 text-indigo-400 px-1.5 rounded font-medium">Host</span>}
                 </div>
                 <div className="text-[11px] text-slate-400">
-                  {peerCount} active peer{peerCount === 1 ? '' : 's'} • {totalCharsUsed}/10k chars
+                  {isConnected ? 'Online' : 'Connecting...'} • {totalCharsUsed}/10k chars
                 </div>
               </div>
             </div>
@@ -527,7 +481,6 @@
                   }`}>
                     <div className="break-words select-text">{msg.text}</div>
 
-                    {/* Reactions display */}
                     {msg.reactions && Object.keys(msg.reactions).length > 0 && (
                       <div className="flex flex-wrap gap-1 mt-1.5 pt-1 border-t border-white/10">
                         {Object.entries(msg.reactions).map(([emoji, count]) => (
@@ -539,7 +492,6 @@
                     )}
                   </div>
 
-                  {/* Reaction Buttons */}
                   <div className="flex gap-1.5 mt-1 px-1 text-xs opacity-60 hover:opacity-100 transition-opacity">
                     <button onClick={() => addReaction(msg.id, '❤️')} className="hover:scale-125 transition-transform">❤️</button>
                     <button onClick={() => addReaction(msg.id, '🔥')} className="hover:scale-125 transition-transform">🔥</button>
@@ -589,7 +541,7 @@
                 </button>
 
                 <h3 className="text-lg font-bold text-white mb-1">Invite Partner</h3>
-                <p className="text-xs text-slate-400 mb-5">Scan this QR code with your phone camera:</p>
+                <p className="text-xs text-slate-400 mb-5">Scan this QR code with any smartphone:</p>
 
                 <div className="flex justify-center mb-5">
                   <QRCodeRenderer text={inviteUrl} size={150} />
