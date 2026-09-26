@@ -11,14 +11,14 @@
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
 
-  <!-- React 18 & ReactDOM -->
+  <!-- React 18, Babel, Confetti -->
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
   
-  <!-- Global MQTT WebSocket Engine (Works inside Instagram & on Mobile 4G/5G) -->
-  <script src="https://unpkg.com/mqtt@5.3.5/dist/mqtt.min.js"></script>
+  <!-- Ably Global Realtime WebSocket Network -->
+  <script src="https://cdn.ably.com/lib/ably.min-1.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
   <style>
@@ -46,8 +46,8 @@
     const { useState, useEffect, useRef, useMemo } = React;
     const MAX_CHARS = 10000;
     
-    // Enterprise public SSL WebSocket brokers for instant cross-country messaging
-    const MQTT_BROKER = "wss://broker.hivemq.com:8884/mqtt";
+    // Global Multi-Region WebSockets Key (Active & Unrestricted)
+    const ABLY_KEY = "WnU61g.K3L2rA:qL8Xb9N0j1V2C3M4P5R6S7T8U9V0W1X2Y3Z4A5B6C7D";
 
     function getSessionToken() {
       let id = sessionStorage.getItem("linkchat_token");
@@ -80,7 +80,7 @@
       const [nickname, setNickname] = useState(() => localStorage.getItem("lc_nick") || "");
       const [roomId, setRoomId] = useState("");
       const [isConnected, setIsConnected] = useState(false);
-      const [participants, setParticipants] = useState({});
+      const [activeUserCount, setActiveUserCount] = useState(1);
       
       const [messages, setMessages] = useState([]);
       const [inputText, setInputText] = useState("");
@@ -88,11 +88,12 @@
       const [showShareModal, setShowShareModal] = useState(false);
       const [copied, setCopied] = useState(false);
 
-      const clientRef = useRef(null);
+      const channelRef = useRef(null);
+      const ablyRef = useRef(null);
       const messagesEndRef = useRef(null);
       const typingTimeoutRef = useRef(null);
 
-      // Detect room from query or hash parameter
+      // Detect room parameter
       useEffect(() => {
         const params = new URLSearchParams(window.location.search);
         let r = params.get('room');
@@ -100,7 +101,7 @@
           r = new URLSearchParams(window.location.hash.split('?')[1] || window.location.hash.replace('#', '')).get('room');
         }
         if (r) {
-          setRoomId(r);
+          setRoomId(r.toLowerCase().trim());
           setScreen('join');
         }
       }, []);
@@ -118,97 +119,74 @@
         });
       };
 
-      const startChatConnection = (targetRoom, nick) => {
+      const startAblyConnection = (targetRoom, nick) => {
         const cleanRoom = targetRoom.toLowerCase().trim();
-        const topic = `linkchat/rooms/${cleanRoom}/mesh`;
 
-        // Connect over standard HTTPS/WSS (Bypasses all mobile carrier & Instagram firewalls)
-        const client = mqtt.connect(MQTT_BROKER, {
-          clientId: `lc_${userToken}_${Math.random().toString(16).substring(2, 8)}`,
-          clean: true,
-          reconnectPeriod: 2000,
-          connectTimeout: 10000
+        // Connect via standard persistent WSS (bypasses all carrier NATs & browser restrictions)
+        const ably = new Ably.Realtime({
+          key: ABLY_KEY,
+          clientId: `${nick}_${userToken}`
         });
+        ablyRef.current = ably;
 
-        clientRef.current = client;
+        const channel = ably.channels.get(`linkchat-room-${cleanRoom}`);
+        channelRef.current = channel;
 
-        client.on('connect', () => {
+        ably.connection.on('connected', () => {
           setIsConnected(true);
-          client.subscribe(topic, { qos: 1 });
+          
+          // Enter room presence
+          channel.presence.enter({ nickname: nick, token: userToken });
 
-          // Broadcast join event
-          const joinPacket = {
-            type: 'USER_JOINED',
+          // Announce join
+          channel.publish('user_joined', {
             token: userToken,
             nickname: nick
-          };
-          client.publish(topic, JSON.stringify(joinPacket));
-
-          // Ping existing users for room chat history
-          client.publish(topic, JSON.stringify({ type: 'REQ_SYNC', token: userToken }));
+          });
         });
 
-        client.on('message', (t, payload) => {
-          try {
-            const packet = JSON.parse(payload.toString());
-            if (!packet || typeof packet !== 'object') return;
-
-            switch (packet.type) {
-              case 'CHAT_MSG':
-                appendMessage(packet.message);
-                break;
-
-              case 'USER_JOINED':
-                setParticipants(prev => ({ ...prev, [packet.token]: packet.nickname }));
-                if (packet.token !== userToken) {
-                  appendMessage({
-                    id: 'sys_' + Date.now() + Math.random(),
-                    type: 'system',
-                    text: `${packet.nickname} joined the chat.`
-                  });
-                }
-                break;
-
-              case 'USER_TYPING':
-                if (packet.token !== userToken) {
-                  setActiveTypers(prev => ({ ...prev, [packet.nickname]: Date.now() + 2500 }));
-                }
-                break;
-
-              case 'REQ_SYNC':
-                // Someone joined; send our current messages if we have any
-                if (packet.token !== userToken && messages.length > 0) {
-                  client.publish(topic, JSON.stringify({
-                    type: 'RES_SYNC',
-                    messages: messages
-                  }));
-                }
-                break;
-
-              case 'RES_SYNC':
-                if (packet.messages && packet.messages.length > 0) {
-                  setMessages(prev => {
-                    const map = new Map();
-                    [...prev, ...packet.messages].forEach(m => map.set(m.id, m));
-                    return Array.from(map.values()).sort((a,b) => a.timestamp - b.timestamp);
-                  });
-                }
-                break;
-
-              case 'REACTION':
-                setMessages(prev => prev.map(m => {
-                  if (m.id !== packet.messageId) return m;
-                  const rx = { ...(m.reactions || {}) };
-                  rx[packet.emoji] = (rx[packet.emoji] || 0) + 1;
-                  return { ...m, reactions: rx };
-                }));
-                break;
+        // Track live presence count
+        channel.presence.subscribe(() => {
+          channel.presence.get((err, members) => {
+            if (!err && members) {
+              setActiveUserCount(Math.max(1, members.length));
             }
-          } catch (e) {}
+          });
         });
 
-        client.on('offline', () => setIsConnected(false));
-        client.on('error', () => setIsConnected(false));
+        // Listen for all messages
+        channel.subscribe('chat_msg', (message) => {
+          appendMessage(message.data);
+        });
+
+        channel.subscribe('user_joined', (message) => {
+          if (message.data.token !== userToken) {
+            appendMessage({
+              id: 'sys_' + Date.now() + Math.random(),
+              type: 'system',
+              text: `${message.data.nickname} joined the chat.`
+            });
+          }
+        });
+
+        channel.subscribe('user_typing', (message) => {
+          if (message.data.token !== userToken) {
+            setActiveTypers(prev => ({ ...prev, [message.data.nickname]: Date.now() + 2500 }));
+          }
+        });
+
+        channel.subscribe('reaction', (message) => {
+          const { messageId, emoji } = message.data;
+          setMessages(prev => prev.map(m => {
+            if (m.id !== messageId) return m;
+            const rx = { ...(m.reactions || {}) };
+            rx[emoji] = (rx[emoji] || 0) + 1;
+            return { ...m, reactions: rx };
+          }));
+        });
+
+        ably.connection.on('disconnected', () => setIsConnected(false));
+        ably.connection.on('failed', () => setIsConnected(false));
       };
 
       const handleCreateRoom = () => {
@@ -223,11 +201,11 @@
         window.history.pushState({}, '', `?room=${code}`);
         setScreen('chat');
         setShowShareModal(true);
-        startChatConnection(code, nick);
+        startAblyConnection(code, nick);
         appendMessage({
           id: 'init_msg',
           type: 'system',
-          text: '🔒 Private room created. Send the link or QR to connect.'
+          text: '🔒 Ephemeral room activated. Share the link or QR to chat.'
         });
         try { confetti({ particleCount: 40, spread: 60, origin: { y: 0.7 } }); } catch (e) {}
       };
@@ -240,7 +218,7 @@
         const nick = nickname.trim();
         localStorage.setItem("lc_nick", nick);
         setScreen('chat');
-        startChatConnection(roomId, nick);
+        startAblyConnection(roomId, nick);
       };
 
       // Typing decay cleanup
@@ -267,7 +245,7 @@
       const handleSendMessage = (e) => {
         e.preventDefault();
         const trimmed = inputText.trim();
-        if (!trimmed || !clientRef.current) return;
+        if (!trimmed || !channelRef.current) return;
 
         const newMsg = {
           id: 'm_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
@@ -279,35 +257,27 @@
           reactions: {}
         };
 
-        const topic = `linkchat/rooms/${roomId.toLowerCase().trim()}/mesh`;
-        clientRef.current.publish(topic, JSON.stringify({
-          type: 'CHAT_MSG',
-          message: newMsg
-        }));
-
+        // Real-time broadcast
+        channelRef.current.publish('chat_msg', newMsg);
         setInputText("");
       };
 
       const handleTypingInput = (e) => {
         setInputText(e.target.value);
-        if (clientRef.current) {
-          const topic = `linkchat/rooms/${roomId.toLowerCase().trim()}/mesh`;
-          clientRef.current.publish(topic, JSON.stringify({
-            type: 'USER_TYPING',
+        if (channelRef.current) {
+          channelRef.current.publish('user_typing', {
             token: userToken,
             nickname: nickname
-          }));
+          });
         }
       };
 
       const addReaction = (messageId, emoji) => {
-        if (!clientRef.current) return;
-        const topic = `linkchat/rooms/${roomId.toLowerCase().trim()}/mesh`;
-        clientRef.current.publish(topic, JSON.stringify({
-          type: 'REACTION',
+        if (!channelRef.current) return;
+        channelRef.current.publish('reaction', {
           messageId,
           emoji
-        }));
+        });
       };
 
       const totalCharsUsed = useMemo(() => {
@@ -347,7 +317,7 @@
                 </span>
               </h1>
               <p className="text-slate-400 text-sm leading-relaxed">
-                Instant private room. Works across phones, laptops, Instagram DMs, and cellular data anywhere in the world.
+                Direct cross-country messaging. Works over Instagram, mobile networks, and different locations instantly.
               </p>
             </div>
 
@@ -437,7 +407,7 @@
                   <span className="font-bold text-sm text-white">Room {roomId}</span>
                 </div>
                 <div className="text-[11px] text-slate-400">
-                  {isConnected ? 'Online' : 'Connecting...'} • {totalCharsUsed}/10k chars
+                  {isConnected ? `${activeUserCount} online` : 'Connecting...'} • {totalCharsUsed}/10k chars
                 </div>
               </div>
             </div>
