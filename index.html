@@ -1,613 +1,236 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>LinkChat — Ephemeral Chat</title>
-  
-  <meta name="description" content="Instant ephemeral private chat. No accounts, no phone numbers, no history." />
-  <meta name="theme-color" content="#090d16" />
-
-  <!-- Tailwind CSS -->
-  <script src="https://cdn.tailwindcss.com"></script>
-
-  <!-- React 18, Babel, Confetti -->
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.6.0/dist/confetti.browser.min.js"></script>
-  
-  <!-- GunDB Resilient Mesh (No API key, multi-relay fallback) -->
-  <script src="https://cdn.jsdelivr.net/npm/gun/gun.js"></script>
-
-  <!-- Font Awesome -->
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-
-  <style>
-    html, body {
-      height: 100%;
-      height: 100dvh;
-      margin: 0;
-      padding: 0;
-      overflow: hidden;
-      background-color: #090d16;
-      -webkit-tap-highlight-color: transparent;
-      user-select: none;
-    }
-    #root { height: 100%; display: flex; flex-direction: column; }
-    .scrollbar-none::-webkit-scrollbar { display: none; }
-    .scrollbar-none { -ms-overflow-style: none; scrollbar-width: none; }
-    @keyframes slideUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-    .animate-msg { animation: slideUp 0.18s ease-out forwards; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>QuickChat</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--me:#2563eb;--text:#111827;--muted:#6b7280;--line:#e5e7eb}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#1b1e25;--text:#f3f4f6;--muted:#9ca3af;--line:#2a2e37}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+#app{display:flex;flex-direction:column;height:100%;max-width:640px;margin:0 auto;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+header{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:12px 16px;background:var(--card);border-bottom:1px solid var(--line)}
+header b{font-size:18px}
+#status{font-size:12px;color:var(--muted)}
+#status:before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:#ef4444}
+#status.on:before{background:#22c55e}
+.btns{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.btns button{background:none;border:1px solid var(--line);color:var(--text);border-radius:999px;padding:4px 12px;font-size:13px}
+#people{padding:8px 16px;background:var(--card);border-bottom:1px solid var(--line);font-size:13px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+#people .cnt{font-weight:600;margin-right:4px}
+.chip{background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:2px 10px}
+.chip.you{border-color:var(--me);color:var(--me)}
+#list{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px}
+.m{max-width:80%;padding:8px 12px;border-radius:16px;background:var(--card);border:1px solid var(--line);overflow-wrap:anywhere}
+.m.me{align-self:flex-end;background:var(--me);color:#fff;border-color:var(--me)}
+.m.bad{opacity:.55}
+.m small{display:block;font-size:11px;opacity:.7;margin-bottom:2px}
+.empty{margin:auto;text-align:center;color:var(--muted);font-size:14px;padding:20px}
+#bar{display:flex;gap:8px;padding:10px 12px;background:var(--card);border-top:1px solid var(--line)}
+#txt{flex:1;font-size:16px;padding:10px 14px;border-radius:999px;border:1px solid var(--line);background:var(--bg);color:var(--text);outline:none}
+#send{border:0;background:var(--me);color:#fff;border-radius:999px;padding:0 20px;font-size:16px;font-weight:600}
+#send:disabled{opacity:.4}
+</style>
 </head>
-<body class="bg-slate-950 text-slate-100 antialiased font-sans">
-  <div id="root"></div>
+<body>
+<div id="app">
+  <header>
+    <div><b>QuickChat</b><div id="status">connecting...</div></div>
+    <div class="btns"><button id="nameBtn"></button><button id="roomBtn"></button><button id="shareBtn">Share</button></div>
+  </header>
+  <div id="people"><span class="cnt">1 online</span></div>
+  <div id="list"></div>
+  <div id="bar"><input id="txt" placeholder="Type a message" maxlength="500" autocomplete="off"><button id="send" disabled>Send</button></div>
+</div>
+<script>
+(function(){
+  // ===== Settings =====
+  // CHANGE APP_ID to any unique text of your own so your chat doesn't mix with other copies of this file.
+  var APP_ID = 'quickchat-x7k2m9';
+  // Free public MQTT brokers (WebSocket over TLS). The app talks to all of them at once and removes duplicates.
+  var BROKERS = ['wss://broker.hivemq.com:8884/mqtt', 'wss://broker.emqx.io:8084/mqtt', 'wss://test.mosquitto.org:8081'];
+  var KEEP = 10;
 
-  <script type="text/babel">
-    const { useState, useEffect, useRef, useMemo, useCallback } = React;
-    const MAX_CHARS = 10000;
+  // ===== Identity, room =====
+  function rnd(n){ var s = '', c = 'abcdefghijklmnopqrstuvwxyz0123456789'; for (var i = 0; i < n; i++) s += c[Math.floor(Math.random() * c.length)]; return s; }
+  function cleanRoom(s){ return String(s || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 40); }
+  var room = cleanRoom(new URLSearchParams(location.search).get('room')) || 'public';
+  var topic = APP_ID + '/' + room;
+  var me = rnd(10);
+  var name = 'Guest' + Math.floor(1000 + Math.random() * 9000);
 
-    // Redundant public Gun relays ensuring delivery across mobile carriers
-    const GUN_PEERS = [
-      'https://gun-manhattan.herokuapp.com/gun',
-      'https://relay.peer.ooo/gun'
-    ];
+  // ===== Tiny MQTT 3.1.1 client (no libraries) =====
+  var enc = new TextEncoder(), dec = new TextDecoder();
+  function str(s){ var b = enc.encode(s), o = new Uint8Array(2 + b.length); o[0] = b.length >> 8; o[1] = b.length & 255; o.set(b, 2); return o; }
+  function cat(){ var n = 0, a = arguments, i; for (i = 0; i < a.length; i++) n += a[i].length; var o = new Uint8Array(n), p = 0; for (i = 0; i < a.length; i++) { o.set(a[i], p); p += a[i].length; } return o; }
+  function pkt(first, body){ var l = [], n = body.length, d; do { d = n % 128; n = Math.floor(n / 128); if (n > 0) d |= 128; l.push(d); } while (n > 0); return cat(new Uint8Array([first].concat(l)), body); }
+  var PING = new Uint8Array([0xC0, 0]);
+  var byePayload = JSON.stringify({ k: 'b', id: me, u: 'bye' + me });
+  var CONNECT = pkt(0x10, cat(str('MQTT'), new Uint8Array([4, 0x06, 0, 60]), str('qc' + me), str(topic), str(byePayload)));
+  var SUB = pkt(0x82, cat(new Uint8Array([0, 1]), str(topic), new Uint8Array([0])));
+  var links = [];
 
-    function getSessionToken() {
-      let id = sessionStorage.getItem("linkchat_uid");
-      if (!id) {
-        id = "u_" + Math.random().toString(36).substring(2, 8) + Date.now().toString(36);
-        sessionStorage.setItem("linkchat_uid", id);
+  function anyOnline(){ return links.some(function(l){ return l.ok; }); }
+
+  function parse(L, data){
+    L.buf = cat(L.buf, data);
+    while (L.buf.length >= 2) {
+      var mul = 1, len = 0, i = 1, b;
+      do { if (i >= L.buf.length) return; b = L.buf[i++]; len += (b & 127) * mul; mul *= 128; } while (b & 128);
+      if (L.buf.length < i + len) return;
+      var type = L.buf[0] >> 4, flags = L.buf[0] & 15, body = L.buf.subarray(i, i + len);
+      L.buf = L.buf.subarray(i + len);
+      if (type === 2) {
+        if (body[1] === 0) {
+          L.ok = true; L.retry = 1000;
+          L.ws.send(SUB);
+          clearInterval(L.ping);
+          L.ping = setInterval(function(){ try { L.ws.send(PING); } catch (e) {} }, 20000);
+          setStatus(); announce(true);
+        } else { try { L.ws.close(); } catch (e) {} }
+      } else if (type === 3) {
+        var tl = (body[0] << 8) | body[1], off = 2 + tl;
+        if ((flags >> 1) & 3) off += 2;
+        onPacket(dec.decode(body.subarray(off)));
       }
-      return id;
     }
+  }
 
-    function generateRoomCode() {
-      const chars = "abcdefghjkmnpqrstuvwxyz23456789";
-      let res = "";
-      for (let i = 0; i < 6; i++) res += chars.charAt(Math.floor(Math.random() * chars.length));
-      return res;
+  function openLink(url){
+    var L = { ok: false, buf: new Uint8Array(0), retry: 1000, ws: null, ping: null };
+    links.push(L);
+    function go(){
+      var ws;
+      try { ws = new WebSocket(url, 'mqtt'); } catch (e) { return later(); }
+      L.ws = ws; L.buf = new Uint8Array(0); ws.binaryType = 'arraybuffer';
+      ws.onopen = function(){ ws.send(CONNECT); };
+      ws.onmessage = function(e){ parse(L, new Uint8Array(e.data)); };
+      ws.onclose = function(){ L.ok = false; clearInterval(L.ping); setStatus(); later(); };
+      ws.onerror = function(){ try { ws.close(); } catch (e) {} };
     }
+    function later(){ if (L.timer) return; L.timer = setTimeout(function(){ L.timer = 0; go(); }, L.retry); L.retry = Math.min(L.retry * 2, 15000); }
+    L.go = go; go();
+  }
 
-    function extractUrls(text) {
-      if (!text) return [];
-      const matches = text.match(/(https?:\/\/[^\s]+)/gi);
-      return matches ? Array.from(new Set(matches)) : [];
+  function publish(obj){
+    var p = pkt(0x30, cat(str(topic), enc.encode(JSON.stringify(obj)))), sent = 0;
+    links.forEach(function(L){ if (L.ok) { try { L.ws.send(p); sent++; } catch (e) {} } });
+    return sent;
+  }
+
+  // ===== Chat state =====
+  var msgs = [], peers = {}, seen = {}, seenOrder = [];
+  var list = document.getElementById('list'), txt = document.getElementById('txt'), send = document.getElementById('send');
+  var statusEl = document.getElementById('status'), nameBtn = document.getElementById('nameBtn');
+  var roomBtn = document.getElementById('roomBtn'), shareBtn = document.getElementById('shareBtn');
+  nameBtn.textContent = name; roomBtn.textContent = '# ' + room;
+
+  function once(u){
+    if (!u || seen[u]) return false;
+    seen[u] = 1; seenOrder.push(u);
+    if (seenOrder.length > 300) delete seen[seenOrder.shift()];
+    return true;
+  }
+  function cl(s, n){ return String(s == null ? '' : s).replace(/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '').trim().slice(0, n); }
+
+  function render(){
+    list.textContent = '';
+    if (!msgs.length) {
+      var e = document.createElement('div'); e.className = 'empty';
+      e.textContent = 'No messages yet. Only the latest ' + KEEP + ' are kept, and nothing is saved.';
+      list.appendChild(e);
     }
+    msgs.forEach(function(m){
+      var d = document.createElement('div'); d.className = 'm' + (m.mine ? ' me' : '') + (m.bad ? ' bad' : '');
+      var s = document.createElement('small'); s.textContent = (m.mine ? 'You' : m.name) + (m.bad ? ' (not sent)' : '');
+      var t = document.createElement('span'); t.textContent = m.text;
+      d.appendChild(s); d.appendChild(t); list.appendChild(d);
+    });
+    list.scrollTop = list.scrollHeight;
+  }
+  function addMsg(m){ msgs.push(m); while (msgs.length > KEEP) msgs.shift(); render(); }
 
-    function QRCodeRenderer({ text, size = 150 }) {
-      const src = `https://api.qrserver.com/v1/create-qr-code/?size=${size * 2}x${size * 2}&data=${encodeURIComponent(text)}&color=090d16&bgcolor=ffffff&qzone=1`;
-      return (
-        <div className="p-3 bg-white rounded-2xl shadow-xl inline-block border border-slate-700">
-          <img src={src} alt="Room QR Code" width={size} height={size} className="rounded-lg block object-contain" />
-        </div>
-      );
+  function renderPeers(){
+    var box = document.getElementById('people'); box.textContent = '';
+    var ids = Object.keys(peers);
+    var c = document.createElement('span'); c.className = 'cnt'; c.textContent = (ids.length + 1) + ' online'; box.appendChild(c);
+    var y = document.createElement('span'); y.className = 'chip you'; y.textContent = name + ' (you)'; box.appendChild(y);
+    ids.forEach(function(id){ var ch = document.createElement('span'); ch.className = 'chip'; ch.textContent = peers[id].name; box.appendChild(ch); });
+  }
+
+  function setStatus(){
+    var on = anyOnline();
+    statusEl.className = on ? 'on' : ''; statusEl.textContent = on ? 'live' : 'connecting...';
+    send.disabled = !on;
+  }
+
+  function announce(join){ publish({ k: 'p', id: me, n: name, j: join ? 1 : 0, u: rnd(8) }); }
+
+  function onPacket(raw){
+    var d; try { d = JSON.parse(raw); } catch (e) { return; }
+    if (!d || typeof d !== 'object' || d.id === me || !once(d.u)) return;
+    var id = cl(d.id, 20); if (!id) return;
+    if (d.k === 'm') {
+      var t = cl(d.t, 500); if (!t) return;
+      addMsg({ name: cl(d.n, 20) || 'Guest', text: t });
+      if (peers[id]) peers[id].seen = Date.now();
+    } else if (d.k === 'p') {
+      peers[id] = { name: cl(d.n, 20) || 'Guest', seen: Date.now() };
+      renderPeers();
+      if (d.j) setTimeout(function(){ announce(false); }, Math.random() * 800); // let newcomers see us quickly
+    } else if (d.k === 'b') {
+      if (peers[id]) { delete peers[id]; renderPeers(); }
     }
+  }
 
-    function App() {
-      const [screen, setScreen] = useState('landing');
-      const [userToken] = useState(getSessionToken);
-      const [nickname, setNickname] = useState(() => localStorage.getItem("lc_nick") || "");
-      const [roomId, setRoomId] = useState("");
-      const [isConnected, setIsConnected] = useState(false);
-      const [participants, setParticipants] = useState({});
-      
-      const [messages, setMessages] = useState([]);
-      const [inputText, setInputText] = useState("");
-      const [activeTypers, setActiveTypers] = useState({});
-      const [showShareModal, setShowShareModal] = useState(false);
-      const [showUsersDrawer, setShowUsersDrawer] = useState(false);
-      const [copied, setCopied] = useState(false);
+  // ===== UI =====
+  var lastSend = 0;
+  function doSend(){
+    var v = txt.value.trim(); if (!v) return;
+    var now = Date.now(); if (now - lastSend < 600) return; lastSend = now;
+    var ok = publish({ k: 'm', id: me, n: name, t: v.slice(0, 500), u: rnd(10) }) > 0;
+    addMsg({ mine: true, text: v.slice(0, 500), bad: !ok });
+    txt.value = ''; txt.focus();
+  }
+  send.onclick = doSend;
+  txt.addEventListener('keydown', function(e){ if (e.key === 'Enter') doSend(); });
 
-      const gunRef = useRef(null);
-      const roomNodeRef = useRef(null);
-      const messagesEndRef = useRef(null);
-      const heartbeatIntervalRef = useRef(null);
+  nameBtn.onclick = function(){
+    var n = prompt('Your display name', name);
+    if (n && cl(n, 20)) { name = cl(n, 20); nameBtn.textContent = name; renderPeers(); announce(false); }
+  };
+  roomBtn.onclick = function(){
+    var r = prompt('Room name. Friends who open the same room link chat with you. Use a hard-to-guess name for privacy.', room);
+    r = cleanRoom(r);
+    if (r && r !== room) location.search = '?room=' + r;
+  };
+  shareBtn.onclick = function(){
+    var url = location.origin + location.pathname + '?room=' + room;
+    if (navigator.share) { navigator.share({ title: 'QuickChat', url: url }).catch(function(){}); }
+    else if (navigator.clipboard) { navigator.clipboard.writeText(url).then(function(){ alert('Link copied'); }, function(){ prompt('Copy this link', url); }); }
+    else prompt('Copy this link', url);
+  };
 
-      // Extract room from URL
-      useEffect(() => {
-        const params = new URLSearchParams(window.location.search);
-        let r = params.get('room');
-        if (!r && window.location.hash.includes('room=')) {
-          r = new URLSearchParams(window.location.hash.split('?')[1] || window.location.hash.replace('#', '')).get('room');
-        }
-        if (r) {
-          setRoomId(r.toLowerCase().trim());
-          setScreen('join');
-        }
-      }, []);
+  // Tidy up: drop people we haven't heard from, send a goodbye on exit, keep presence fresh.
+  setInterval(function(){
+    var now = Date.now(), ch = false;
+    Object.keys(peers).forEach(function(id){ if (now - peers[id].seen > 80000) { delete peers[id]; ch = true; } });
+    if (ch) renderPeers();
+    if (anyOnline()) announce(false);
+  }, 25000);
+  window.addEventListener('pagehide', function(){ publish({ k: 'b', id: me, u: rnd(8) }); });
+  document.addEventListener('visibilitychange', function(){
+    if (document.visibilityState !== 'visible') return;
+    links.forEach(function(L){
+      if (!L.ok && (!L.ws || L.ws.readyState > 1)) { if (L.timer) { clearTimeout(L.timer); L.timer = 0; } L.go(); }
+    });
+    announce(true);
+  });
 
-      const appendMessage = useCallback((msg) => {
-        setMessages(prev => {
-          if (prev.some(m => m.id === msg.id)) return prev;
-          let list = [...prev, msg].sort((a,b) => a.timestamp - b.timestamp);
-          let total = list.reduce((a, m) => a + (m.text ? m.text.length : 0), 0);
-          while (total > MAX_CHARS && list.length > 1) {
-            const out = list.shift();
-            if (out && out.text) total -= out.text.length;
-          }
-          return list;
-        });
-      }, []);
-
-      const connectGunRoom = (roomCode, myNick) => {
-        const cleanRoom = roomCode.toLowerCase().trim();
-
-        // Initialize Gun with fallback peers and disable localStorage persistence
-        const gun = Gun({
-          peers: GUN_PEERS,
-          localStorage: false,
-          radisk: false
-        });
-        gunRef.current = gun;
-
-        const roomNode = gun.get(`linkchat_v3_${cleanRoom}`);
-        roomNodeRef.current = roomNode;
-
-        setIsConnected(true);
-
-        // Announce presence
-        roomNode.get('users').get(userToken).put({
-          nickname: myNick,
-          lastSeen: Date.now()
-        });
-
-        // Track active participants
-        roomNode.get('users').map().on((userData, token) => {
-          if (!userData || !userData.nickname) return;
-          if (Date.now() - userData.lastSeen < 45000) {
-            setParticipants(prev => ({
-              ...prev,
-              [token]: { nickname: userData.nickname, lastSeen: userData.lastSeen }
-            }));
-          }
-        });
-
-        // Heartbeat interval
-        heartbeatIntervalRef.current = setInterval(() => {
-          roomNode.get('users').get(userToken).put({
-            nickname: myNick,
-            lastSeen: Date.now()
-          });
-        }, 12000);
-
-        // Listen for new messages
-        roomNode.get('messages').map().on((msgData, msgId) => {
-          if (!msgData || !msgData.text) return;
-          appendMessage({
-            id: msgId,
-            type: 'user',
-            senderToken: msgData.senderToken,
-            senderNickname: msgData.senderNickname,
-            text: msgData.text,
-            timestamp: msgData.timestamp,
-            reactions: msgData.reactions ? JSON.parse(msgData.reactions) : {},
-            urls: extractUrls(msgData.text)
-          });
-        });
-
-        // Listen for typing indicators
-        roomNode.get('typing').map().on((typingData, token) => {
-          if (!typingData || token === userToken) return;
-          if (Date.now() - typingData.timestamp < 3000) {
-            setActiveTypers(prev => ({ ...prev, [typingData.nickname]: Date.now() + 2500 }));
-          }
-        });
-      };
-
-      const handleCreateRoom = () => {
-        if (!nickname.trim()) {
-          alert("Please enter a temporary nickname.");
-          return;
-        }
-        const nick = nickname.trim();
-        localStorage.setItem("lc_nick", nick);
-        const code = generateRoomCode();
-        setRoomId(code);
-        window.history.pushState({}, '', `?room=${code}`);
-        setScreen('chat');
-        setShowShareModal(true);
-        connectGunRoom(code, nick);
-        try { confetti({ particleCount: 40, spread: 60, origin: { y: 0.7 } }); } catch (e) {}
-      };
-
-      const handleJoinRoom = () => {
-        if (!nickname.trim()) {
-          alert("Please enter a nickname.");
-          return;
-        }
-        const nick = nickname.trim();
-        localStorage.setItem("lc_nick", nick);
-        setScreen('chat');
-        connectGunRoom(roomId, nick);
-      };
-
-      // Periodic presence cleanup (stale heartbeats > 35s)
-      useEffect(() => {
-        const iv = setInterval(() => {
-          const now = Date.now();
-          setParticipants(prev => {
-            let changed = false;
-            const updated = {};
-            for (const [token, data] of Object.entries(prev)) {
-              if (token === userToken || (now - data.lastSeen < 35000)) {
-                updated[token] = data;
-              } else {
-                changed = true;
-              }
-            }
-            return changed ? updated : prev;
-          });
-
-          // Typing decay
-          setActiveTypers(prev => {
-            let changed = false;
-            const updated = {};
-            for (const [name, expire] of Object.entries(prev)) {
-              if (expire > now) updated[name] = expire;
-              else changed = true;
-            }
-            return changed ? updated : prev;
-          });
-        }, 1500);
-
-        return () => clearInterval(iv);
-      }, [userToken]);
-
-      useEffect(() => {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-      }, [messages, activeTypers]);
-
-      const handleSendMessage = (e) => {
-        e.preventDefault();
-        const trimmed = inputText.trim();
-        if (!trimmed || !roomNodeRef.current) return;
-
-        const msgId = 'm_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
-
-        roomNodeRef.current.get('messages').get(msgId).put({
-          senderToken: userToken,
-          senderNickname: nickname,
-          text: trimmed,
-          timestamp: Date.now(),
-          reactions: JSON.stringify({})
-        });
-
-        setInputText("");
-      };
-
-      const handleTypingInput = (e) => {
-        setInputText(e.target.value);
-        if (roomNodeRef.current) {
-          roomNodeRef.current.get('typing').get(userToken).put({
-            nickname: nickname,
-            timestamp: Date.now()
-          });
-        }
-      };
-
-      const addReaction = (messageId, emoji) => {
-        if (!roomNodeRef.current) return;
-        const msg = messages.find(m => m.id === messageId);
-        if (!msg) return;
-
-        const rx = { ...(msg.reactions || {}) };
-        rx[emoji] = (rx[emoji] || 0) + 1;
-
-        roomNodeRef.current.get('messages').get(messageId).get('reactions').put(JSON.stringify(rx));
-      };
-
-      const totalCharsUsed = useMemo(() => {
-        return messages.reduce((a, m) => a + (m.text ? m.text.length : 0), 0);
-      }, [messages]);
-
-      const participantCount = useMemo(() => {
-        return Math.max(1, Object.keys(participants).length);
-      }, [participants]);
-
-      const inviteUrl = `${window.location.origin}${window.location.pathname}?room=${roomId}`;
-
-      const handleShareLink = async () => {
-        if (navigator.share) {
-          try {
-            await navigator.share({
-              title: "Join my LinkChat",
-              text: "Private ephemeral chat room. Zero registration.",
-              url: inviteUrl
-            });
-          } catch (e) {}
-        } else {
-          navigator.clipboard.writeText(inviteUrl);
-          setCopied(true);
-          setTimeout(() => setCopied(false), 2000);
-        }
-      };
-
-      // --- SCREEN 1: LANDING ---
-      if (screen === 'landing') {
-        return (
-          <div className="flex-1 flex flex-col justify-between max-w-md mx-auto w-full p-6 overflow-y-auto">
-            <div className="pt-8">
-              <div className="w-14 h-14 rounded-2xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400 text-2xl mb-6 shadow-lg shadow-indigo-500/10">
-                <i className="fa-solid fa-bolt"></i>
-              </div>
-              <h1 className="text-3xl font-extrabold text-white tracking-tight mb-3">
-                Chat without <br />
-                <span className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 via-purple-300 to-pink-400">
-                  accounts.
-                </span>
-              </h1>
-              <p className="text-slate-400 text-sm leading-relaxed">
-                Direct cross-country messaging. Works over Instagram, mobile networks, and different locations instantly.
-              </p>
-            </div>
-
-            <div className="my-8 bg-slate-900/90 border border-slate-800 rounded-3xl p-6 shadow-2xl backdrop-blur-xl">
-              <label className="block text-xs uppercase font-bold tracking-wider text-slate-400 mb-2">
-                Your Nickname
-              </label>
-              <input
-                type="text"
-                maxLength={20}
-                placeholder="e.g. Alex, Maverick"
-                value={nickname}
-                onChange={(e) => setNickname(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3.5 text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition-all font-medium mb-5"
-              />
-
-              <button
-                type="button"
-                onClick={handleCreateRoom}
-                className="w-full bg-indigo-600 hover:bg-indigo-500 active:scale-[0.98] text-white font-semibold py-4 rounded-2xl shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2 transition-all"
-              >
-                <span>Create Private Chat</span>
-                <i className="fa-solid fa-arrow-right text-xs"></i>
-              </button>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3 text-xs text-slate-400 pb-4">
-              <div className="flex items-center gap-2 p-3 rounded-2xl bg-slate-900/60 border border-slate-800/80">
-                <i className="fa-brands fa-instagram text-pink-400 text-sm"></i>
-                <span>Reel Previews</span>
-              </div>
-              <div className="flex items-center gap-2 p-3 rounded-2xl bg-slate-900/60 border border-slate-800/80">
-                <i className="fa-solid fa-shield-halved text-indigo-400 text-sm"></i>
-                <span>100% Ephemeral</span>
-              </div>
-            </div>
-          </div>
-        );
-      }
-
-      // --- SCREEN 2: JOIN ---
-      if (screen === 'join') {
-        return (
-          <div className="flex-1 flex flex-col justify-center max-w-sm mx-auto w-full p-6">
-            <div className="bg-slate-900 border border-slate-800 rounded-3xl p-7 shadow-2xl backdrop-blur-xl text-center">
-              <div className="w-14 h-14 mx-auto rounded-2xl bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 flex items-center justify-center text-xl mb-4">
-                <i className="fa-solid fa-door-open"></i>
-              </div>
-              <h2 className="text-xl font-bold text-white mb-1">Join Chat Room</h2>
-              <p className="text-xs text-slate-400 mb-6">
-                Room <span className="font-mono text-indigo-400 font-bold">{roomId}</span>
-              </p>
-
-              <input
-                type="text"
-                autoFocus
-                maxLength={20}
-                placeholder="Enter your nickname..."
-                value={nickname}
-                onChange={(e) => setNickname(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleJoinRoom()}
-                className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3.5 text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 mb-4 text-center font-medium"
-              />
-
-              <button
-                type="button"
-                onClick={handleJoinRoom}
-                className="w-full bg-indigo-600 hover:bg-indigo-500 active:scale-[0.98] text-white font-semibold py-3.5 rounded-2xl shadow-lg shadow-indigo-600/30 transition-all"
-              >
-                Enter Chat
-              </button>
-            </div>
-          </div>
-        );
-      }
-
-      // --- SCREEN 3: ACTIVE CHAT ROOM ---
-      return (
-        <div className="flex-1 flex flex-col h-full relative max-w-md mx-auto w-full border-x border-slate-900 shadow-2xl">
-          
-          {/* Header */}
-          <header className="px-4 py-3 bg-slate-900/90 border-b border-slate-800/80 flex items-center justify-between sticky top-0 z-30 backdrop-blur-md">
-            <div className="flex items-center gap-3">
-              <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></div>
-              <div>
-                <div className="flex items-center gap-1.5">
-                  <span className="font-bold text-sm text-white">Room {roomId}</span>
-                </div>
-                <div 
-                  onClick={() => setShowUsersDrawer(true)}
-                  className="text-[11px] text-slate-400 cursor-pointer hover:text-indigo-400 transition-colors flex items-center gap-1"
-                >
-                  <span className="font-semibold text-emerald-400">{participantCount} online</span>
-                  <span>•</span>
-                  <span>{totalCharsUsed}/10k chars</span>
-                  <i className="fa-solid fa-angle-right text-[9px] ml-0.5"></i>
-                </div>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setShowShareModal(true)}
-                className="p-2 rounded-xl bg-slate-800 text-slate-300 hover:text-white text-xs flex items-center gap-1.5 active:scale-95 transition-all"
-              >
-                <i className="fa-solid fa-share-nodes"></i>
-                <span>Invite</span>
-              </button>
-            </div>
-          </header>
-
-          {/* Messages */}
-          <main className="flex-1 overflow-y-auto px-4 py-4 space-y-3.5 scrollbar-none">
-            {messages.map((msg) => {
-              const isMe = msg.senderToken === userToken;
-              const time = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-              return (
-                <div key={msg.id} className={`flex flex-col animate-msg ${isMe ? 'items-end' : 'items-start'}`}>
-                  <div className="flex items-center gap-1.5 mb-1 px-1 text-[11px]">
-                    <span className={isMe ? 'text-indigo-400 font-medium' : 'text-slate-400'}>{msg.senderNickname}</span>
-                    <span className="text-[10px] text-slate-600">{time}</span>
-                  </div>
-
-                  <div className={`relative max-w-[85%] rounded-2xl px-4 py-2.5 text-sm ${
-                    isMe ? 'bg-indigo-600 text-white rounded-tr-xs' : 'bg-slate-900 text-slate-100 border border-slate-800 rounded-tl-xs'
-                  }`}>
-                    <div className="break-words select-text">{msg.text}</div>
-
-                    {/* Rich Media Cards */}
-                    {msg.urls && msg.urls.length > 0 && (
-                      <div className="mt-2 space-y-1.5">
-                        {msg.urls.map((u, i) => (
-                          <a 
-                            key={i} 
-                            href={u} 
-                            target="_blank" 
-                            rel="noopener noreferrer" 
-                            className="block p-2 rounded-xl bg-black/30 border border-white/10 text-xs text-indigo-300 hover:text-white truncate"
-                          >
-                            <i className="fa-solid fa-arrow-up-right-from-square mr-1 text-[10px]"></i>
-                            {u}
-                          </a>
-                        ))}
-                      </div>
-                    )}
-
-                    {/* Reactions display */}
-                    {msg.reactions && Object.keys(msg.reactions).length > 0 && (
-                      <div className="flex flex-wrap gap-1 mt-1.5 pt-1 border-t border-white/10">
-                        {Object.entries(msg.reactions).map(([emoji, count]) => (
-                          <span key={emoji} className="text-xs bg-black/20 px-1.5 py-0.5 rounded-full">
-                            {emoji} {count > 1 ? count : ''}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="flex gap-1.5 mt-1 px-1 text-xs opacity-60 hover:opacity-100 transition-opacity">
-                    <button onClick={() => addReaction(msg.id, '❤️')} className="hover:scale-125 transition-transform">❤️</button>
-                    <button onClick={() => addReaction(msg.id, '🔥')} className="hover:scale-125 transition-transform">🔥</button>
-                    <button onClick={() => addReaction(msg.id, '😂')} className="hover:scale-125 transition-transform">😂</button>
-                  </div>
-                </div>
-              );
-            })}
-
-            {Object.keys(activeTypers).length > 0 && (
-              <div className="text-xs text-indigo-400 italic py-1 animate-pulse">
-                {Object.keys(activeTypers).join(', ')} is typing...
-              </div>
-            )}
-            <div ref={messagesEndRef} />
-          </main>
-
-          {/* Composer */}
-          <footer className="p-3 bg-slate-900/90 border-t border-slate-800/80 sticky bottom-0 z-20 backdrop-blur-md">
-            <form onSubmit={handleSendMessage} className="flex items-center gap-2">
-              <input
-                type="text"
-                placeholder="Type a message or drop a link..."
-                value={inputText}
-                onChange={handleTypingInput}
-                className="flex-1 bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition-all"
-              />
-              <button
-                type="submit"
-                disabled={!inputText.trim()}
-                className="w-11 h-11 bg-indigo-600 hover:bg-indigo-500 active:scale-95 disabled:bg-slate-800 disabled:text-slate-600 text-white rounded-2xl flex items-center justify-center shrink-0 shadow-md transition-all"
-              >
-                <i className="fa-solid fa-arrow-up text-sm"></i>
-              </button>
-            </form>
-          </footer>
-
-          {/* Participants Drawer */}
-          {showUsersDrawer && (
-            <div className="fixed inset-0 z-50 bg-black/75 flex justify-end backdrop-blur-sm">
-              <div className="w-full max-w-xs bg-slate-900 h-full p-5 flex flex-col justify-between border-l border-slate-800 shadow-2xl">
-                <div>
-                  <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-4">
-                    <h3 className="font-bold text-white text-base">Participants ({participantCount})</h3>
-                    <button onClick={() => setShowUsersDrawer(false)} className="p-1 rounded-lg text-slate-400 hover:text-white">✕</button>
-                  </div>
-                  <div className="space-y-2">
-                    {Object.entries(participants).map(([tok, data]) => (
-                      <div key={tok} className="flex items-center justify-between p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
-                        <span className="text-sm font-medium text-slate-200">
-                          {data.nickname} {tok === userToken ? '(You)' : ''}
-                        </span>
-                        <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                <button
-                  onClick={() => setShowUsersDrawer(false)}
-                  className="w-full py-2.5 rounded-xl bg-slate-800 text-slate-300 font-semibold text-xs"
-                >
-                  Close
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Share Modal */}
-          {showShareModal && (
-            <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4 backdrop-blur-sm">
-              <div className="bg-slate-900 border border-slate-800 rounded-3xl max-w-sm w-full p-6 text-center relative shadow-2xl">
-                <button
-                  onClick={() => setShowShareModal(false)}
-                  className="absolute top-4 right-4 p-1.5 text-slate-400 hover:text-white rounded-full bg-slate-800 text-xs w-6 h-6 flex items-center justify-center"
-                >
-                  ✕
-                </button>
-
-                <h3 className="text-lg font-bold text-white mb-1">Invite Partner</h3>
-                <p className="text-xs text-slate-400 mb-5">Scan this QR code with any smartphone camera:</p>
-
-                <div className="flex justify-center mb-5">
-                  <QRCodeRenderer text={inviteUrl} size={150} />
-                </div>
-
-                <div className="flex items-center gap-2 bg-slate-950 p-2 rounded-2xl border border-slate-800 mb-4">
-                  <input
-                    type="text"
-                    readOnly
-                    value={inviteUrl}
-                    className="bg-transparent text-xs text-slate-300 w-full px-2 outline-none font-mono truncate"
-                  />
-                  <button
-                    onClick={handleShareLink}
-                    className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white transition-colors shrink-0"
-                  >
-                    {copied ? "Copied!" : "Copy"}
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
-        </div>
-      );
-    }
-
-    const root = ReactDOM.createRoot(document.getElementById('root'));
-    root.render(<App />);
-  </script>
+  render(); renderPeers(); setStatus();
+  BROKERS.forEach(openLink);
+})();
+</script>
 </body>
 </html>
