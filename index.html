@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>QuickChat</title>
 <style>
-:root{--bg:#f4f5f7;--card:#fff;--me:#2563eb;--text:#111827;--muted:#6b7280;--line:#e5e7eb}
+:root{--bg:#f4f5f7;--card:#fff;--me:#0f766e;--text:#111827;--muted:#6b7280;--line:#e5e7eb}
 @media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#1b1e25;--text:#f3f4f6;--muted:#9ca3af;--line:#2a2e37}}
 *{box-sizing:border-box}
 html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
@@ -26,6 +26,23 @@ header b{font-size:18px}
 .m.me{align-self:flex-end;background:var(--me);color:#fff;border-color:var(--me)}
 .m.bad{opacity:.55}
 .m small{display:block;font-size:11px;opacity:.7;margin-bottom:2px}
+.m{cursor:pointer;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+.tick{float:right;margin-left:10px;font-size:12px;letter-spacing:-2px;color:rgba(255,255,255,.7)}
+.tick.read{color:#7dd3fc}
+.tick.bad{color:#fecaca;letter-spacing:0}
+.m.sel{outline:2px solid #f59e0b}
+.q{border-left:3px solid #f59e0b;background:rgba(127,127,127,.18);border-radius:6px;padding:3px 8px;margin-bottom:4px;font-size:12px}
+.q b{display:block;font-weight:600}
+#typing{height:20px;padding:0 16px;font-size:12px;color:var(--muted);background:var(--bg)}
+#replybar{display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--card);border-top:1px solid var(--line);font-size:13px}
+#replybar[hidden]{display:none}
+#replybar div{flex:1;min-width:0;border-left:3px solid #f59e0b;padding-left:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#replybar button{background:none;border:0;color:var(--muted);font-size:20px}
+#wm{position:fixed;inset:0;pointer-events:none;z-index:5;opacity:.07}
+#shield{position:fixed;inset:0;z-index:10;display:none;align-items:center;justify-content:center;background:var(--bg);color:var(--muted);font-size:15px;text-align:center;padding:20px}
+body.priv #shield{display:flex}
+body.priv #app{filter:blur(24px)}
+@media print{body{display:none!important}}
 .empty{margin:auto;text-align:center;color:var(--muted);font-size:14px;padding:20px}
 #bar{display:flex;gap:8px;padding:10px 12px;background:var(--card);border-top:1px solid var(--line)}
 #txt{flex:1;font-size:16px;padding:10px 14px;border-radius:999px;border:1px solid var(--line);background:var(--bg);color:var(--text);outline:none}
@@ -37,12 +54,16 @@ header b{font-size:18px}
 <div id="app">
   <header>
     <div><b>QuickChat</b><div id="status">connecting...</div></div>
-    <div class="btns"><button id="nameBtn"></button><button id="roomBtn"></button><button id="shareBtn">Share</button></div>
+    <div class="btns"><button id="nameBtn"></button><button id="roomBtn"></button><button id="shareBtn">Share</button><button id="vanBtn"></button></div>
   </header>
   <div id="people"><span class="cnt">1 online</span></div>
   <div id="list"></div>
+  <div id="typing"></div>
+  <div id="replybar" hidden><div id="replytxt"></div><button id="replyx" aria-label="Cancel reply">&times;</button></div>
   <div id="bar"><input id="txt" placeholder="Type a message" maxlength="500" autocomplete="off"><button id="send" disabled>Send</button></div>
 </div>
+<div id="wm"></div>
+<div id="shield">Chat hidden for privacy.<br>Return to this tab to continue.</div>
 <script>
 (function(){
   // ===== Settings =====
@@ -120,7 +141,7 @@ header b{font-size:18px}
   }
 
   // ===== Chat state =====
-  var msgs = [], peers = {}, seen = {}, seenOrder = [];
+  var msgs = [], peers = {}, seen = {}, seenOrder = [], typers = {}, replyTo = null, vanish = true, BURN_MS = 8000;
   var list = document.getElementById('list'), txt = document.getElementById('txt'), send = document.getElementById('send');
   var statusEl = document.getElementById('status'), nameBtn = document.getElementById('nameBtn');
   var roomBtn = document.getElementById('roomBtn'), shareBtn = document.getElementById('shareBtn');
@@ -134,6 +155,32 @@ header b{font-size:18px}
   }
   function cl(s, n){ return String(s == null ? '' : s).replace(/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '').trim().slice(0, n); }
 
+  function statusOf(m){
+    if (m.bad) return 'bad';
+    var req = (m.recips || []).filter(function(id){ return peers[id]; });
+    if (req.length && req.every(function(id){ return m.rd[id]; })) return 'read';
+    if (Object.keys(m.dl || {}).length || Object.keys(m.rd || {}).length) return 'delivered';
+    return 'sent';
+  }
+  function removeMsg(mid){
+    msgs = msgs.filter(function(x){ return x.mid !== mid; });
+    if (replyTo && replyTo.mid === mid) clearReply(); else render();
+  }
+  function startBurn(m){
+    if (!vanish || m.burn) return;
+    m.vanishing = true;
+    m.burn = setTimeout(function(){ removeMsg(m.mid); }, BURN_MS);
+  }
+  function check(m){ if (m.mine && statusOf(m) === 'read') startBurn(m); }
+  function seeing(){ return document.visibilityState === 'visible' && !document.body.classList.contains('priv'); }
+  function markRead(m){
+    if (m.mine || m.readSent) return;
+    m.readSent = 1;
+    publish({ k: 'v', id: me, ref: m.mid, u: rnd(8) });
+    startBurn(m);
+  }
+  function flushReads(){ if (!seeing()) return; msgs.forEach(markRead); render(); }
+
   function render(){
     list.textContent = '';
     if (!msgs.length) {
@@ -142,21 +189,38 @@ header b{font-size:18px}
       list.appendChild(e);
     }
     msgs.forEach(function(m){
-      var d = document.createElement('div'); d.className = 'm' + (m.mine ? ' me' : '') + (m.bad ? ' bad' : '');
-      var s = document.createElement('small'); s.textContent = (m.mine ? 'You' : m.name) + (m.bad ? ' (not sent)' : '');
-      var t = document.createElement('span'); t.textContent = m.text;
-      d.appendChild(s); d.appendChild(t); list.appendChild(d);
+      var d = document.createElement('div'); d.className = 'm' + (m.mine ? ' me' : '') + (m.bad ? ' bad' : '') + (replyTo && replyTo.mid === m.mid ? ' sel' : '');
+      d.setAttribute('data-mid', m.mid || '');
+      var s = document.createElement('small'); s.textContent = (m.mine ? 'You' : m.name) + (m.vanishing ? ' \u00b7 vanishing' : '');
+      d.appendChild(s);
+      if (m.rt) {
+        var q = document.createElement('div'); q.className = 'q';
+        var qb = document.createElement('b'); qb.textContent = m.rn || 'Guest';
+        var qt = document.createElement('span'); qt.textContent = m.rt;
+        q.appendChild(qb); q.appendChild(qt); d.appendChild(q);
+      }
+      var t = document.createElement('span'); t.textContent = m.text; d.appendChild(t);
+      if (m.mine) {
+        var st = statusOf(m), k = document.createElement('span');
+        k.className = 'tick ' + (st === 'read' ? 'read' : st === 'bad' ? 'bad' : '');
+        k.textContent = st === 'bad' ? '!' : st === 'sent' ? '\u2713' : '\u2713\u2713';
+        t.appendChild(k);
+      }
+      d.onclick = function(){ pickReply(m); };
+      list.appendChild(d);
     });
     list.scrollTop = list.scrollHeight;
   }
   function addMsg(m){ msgs.push(m); while (msgs.length > KEEP) msgs.shift(); render(); }
 
   function renderPeers(){
+    msgs.forEach(check);
     var box = document.getElementById('people'); box.textContent = '';
     var ids = Object.keys(peers);
     var c = document.createElement('span'); c.className = 'cnt'; c.textContent = (ids.length + 1) + ' online'; box.appendChild(c);
     var y = document.createElement('span'); y.className = 'chip you'; y.textContent = name + ' (you)'; box.appendChild(y);
     ids.forEach(function(id){ var ch = document.createElement('span'); ch.className = 'chip'; ch.textContent = peers[id].name; box.appendChild(ch); });
+    render();
   }
 
   function setStatus(){
@@ -173,24 +237,86 @@ header b{font-size:18px}
     var id = cl(d.id, 20); if (!id) return;
     if (d.k === 'm') {
       var t = cl(d.t, 500); if (!t) return;
-      addMsg({ name: cl(d.n, 20) || 'Guest', text: t });
+      delete typers[id]; showTyping();
+      var im = { mid: cl(d.u, 20), name: cl(d.n, 20) || 'Guest', text: t, rn: cl(d.rn, 20), rt: cl(d.rt, 80) };
+      addMsg(im);
+      publish({ k: 'a', id: me, ref: im.mid, u: rnd(8) });
+      if (seeing()) { markRead(im); render(); }
       if (peers[id]) peers[id].seen = Date.now();
     } else if (d.k === 'p') {
       peers[id] = { name: cl(d.n, 20) || 'Guest', seen: Date.now() };
       renderPeers();
       if (d.j) setTimeout(function(){ announce(false); }, Math.random() * 800); // let newcomers see us quickly
+    } else if (d.k === 'a' || d.k === 'v') {
+      var ref = cl(d.ref, 20), tm = null;
+      msgs.forEach(function(x){ if (x.mine && x.mid === ref) tm = x; });
+      if (tm) { tm.dl[id] = 1; if (d.k === 'v') tm.rd[id] = 1; check(tm); render(); }
+    } else if (d.k === 't') {
+      typers[id] = { name: cl(d.n, 20) || 'Guest', at: Date.now() }; showTyping();
     } else if (d.k === 'b') {
+      delete typers[id]; showTyping();
       if (peers[id]) { delete peers[id]; renderPeers(); }
     }
   }
 
   // ===== UI =====
+  var replyBar = document.getElementById('replybar'), replyTxt = document.getElementById('replytxt'), typingEl = document.getElementById('typing');
+  function pickReply(m){
+    if (replyTo && replyTo.mid === m.mid) { clearReply(); return; }
+    replyTo = m;
+    replyTxt.textContent = 'Replying to ' + (m.mine ? 'yourself' : m.name) + ': ' + m.text.slice(0, 80);
+    replyBar.hidden = false; render(); txt.focus();
+  }
+  function clearReply(){ replyTo = null; replyBar.hidden = true; render(); }
+  document.getElementById('replyx').onclick = clearReply;
+
+  function showTyping(){
+    var now = Date.now(), n = [];
+    Object.keys(typers).forEach(function(id){ if (now - typers[id].at > 4000) delete typers[id]; else n.push(typers[id].name); });
+    typingEl.textContent = !n.length ? '' : (n.length === 1 ? n[0] + ' is typing...' : n.length === 2 ? n.join(' and ') + ' are typing...' : 'Several people are typing...');
+  }
+  setInterval(showTyping, 1000);
+  var lastTyping = 0;
+  txt.addEventListener('input', function(){
+    var now = Date.now();
+    if (txt.value && now - lastTyping > 2000) { lastTyping = now; publish({ k: 't', id: me, n: name, u: rnd(8) }); }
+  });
+
+  // Privacy: a web page cannot block screenshots, but it can hide the chat when the tab/app is left,
+  // block printing and copying, and stamp a faint watermark with your name.
+  function priv(on){ document.body.classList.toggle('priv', on); if (!on) flushReads(); }
+  document.addEventListener('visibilitychange', function(){ priv(document.visibilityState !== 'visible'); });
+  window.addEventListener('blur', function(){ priv(true); });
+  window.addEventListener('focus', function(){ priv(false); });
+  document.addEventListener('contextmenu', function(e){ e.preventDefault(); });
+  document.addEventListener('copy', function(e){ e.preventDefault(); });
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'PrintScreen' || ((e.ctrlKey || e.metaKey) && (e.key === 'p' || e.key === 's')) || (e.metaKey && e.shiftKey)) {
+      priv(true); setTimeout(function(){ priv(false); }, 1500);
+      try { navigator.clipboard.writeText(''); } catch (x) {}
+      if (e.key !== 'PrintScreen') e.preventDefault();
+    }
+  });
+  function watermark(){
+    var t = name.replace(/[<>&"]/g, '');
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="220" height="140"><text x="10" y="80" transform="rotate(-25 110 70)" font-size="16" font-family="sans-serif" fill="#888">' + t + '</text></svg>';
+    document.getElementById('wm').style.backgroundImage = 'url("data:image/svg+xml,' + encodeURIComponent(svg) + '")';
+  }
+  watermark();
+
+  var vanBtn = document.getElementById('vanBtn');
+  function vanLabel(){ vanBtn.textContent = vanish ? 'Vanish: on' : 'Vanish: off'; }
+  vanBtn.onclick = function(){ vanish = !vanish; vanLabel(); };
+  vanLabel();
   var lastSend = 0;
   function doSend(){
     var v = txt.value.trim(); if (!v) return;
     var now = Date.now(); if (now - lastSend < 600) return; lastSend = now;
-    var ok = publish({ k: 'm', id: me, n: name, t: v.slice(0, 500), u: rnd(10) }) > 0;
-    addMsg({ mine: true, text: v.slice(0, 500), bad: !ok });
+    var u = rnd(10), body = { k: 'm', id: me, n: name, t: v.slice(0, 500), u: u }, rn = '', rt = '';
+    if (replyTo) { rn = replyTo.mine ? name : replyTo.name; rt = replyTo.text.slice(0, 80); body.rn = rn; body.rt = rt; }
+    var ok = publish(body) > 0;
+    addMsg({ mid: u, mine: true, text: v.slice(0, 500), bad: !ok, rn: rn, rt: rt, recips: Object.keys(peers), dl: {}, rd: {} });
+    clearReply();
     txt.value = ''; txt.focus();
   }
   send.onclick = doSend;
@@ -198,7 +324,7 @@ header b{font-size:18px}
 
   nameBtn.onclick = function(){
     var n = prompt('Your display name', name);
-    if (n && cl(n, 20)) { name = cl(n, 20); nameBtn.textContent = name; renderPeers(); announce(false); }
+    if (n && cl(n, 20)) { name = cl(n, 20); nameBtn.textContent = name; renderPeers(); announce(false); watermark(); }
   };
   roomBtn.onclick = function(){
     var r = prompt('Room name. Friends who open the same room link chat with you. Use a hard-to-guess name for privacy.', room);
