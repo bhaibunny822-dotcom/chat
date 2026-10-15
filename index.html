@@ -33,6 +33,8 @@ header b{font-size:18px}
 .m.sel{outline:2px solid #f59e0b}
 .q{border-left:3px solid #f59e0b;background:rgba(127,127,127,.18);border-radius:6px;padding:3px 8px;margin-bottom:4px;font-size:12px}
 .q b{display:block;font-weight:600}
+#note{padding:6px 16px;font-size:12px;text-align:center;background:#f59e0b;color:#111}
+#note[hidden]{display:none}
 #typing{height:20px;padding:0 16px;font-size:12px;color:var(--muted);background:var(--bg)}
 #replybar{display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--card);border-top:1px solid var(--line);font-size:13px}
 #replybar[hidden]{display:none}
@@ -56,6 +58,7 @@ body.priv #app{filter:blur(24px)}
     <div><b>QuickChat</b><div id="status">connecting...</div></div>
     <div class="btns"><button id="nameBtn"></button><button id="roomBtn"></button><button id="shareBtn">Share</button><button id="vanBtn"></button></div>
   </header>
+  <div id="note" hidden></div>
   <div id="people"><span class="cnt">1 online</span></div>
   <div id="list"></div>
   <div id="typing"></div>
@@ -141,7 +144,7 @@ body.priv #app{filter:blur(24px)}
   }
 
   // ===== Chat state =====
-  var msgs = [], peers = {}, seen = {}, seenOrder = [], typers = {}, replyTo = null, vanish = true, BURN_MS = 8000;
+  var msgs = [], peers = {}, seen = {}, seenOrder = [], typers = {}, replyTo = null, vanish = true, vanishT = 0, BURN_MS = 8000;
   var list = document.getElementById('list'), txt = document.getElementById('txt'), send = document.getElementById('send');
   var statusEl = document.getElementById('status'), nameBtn = document.getElementById('nameBtn');
   var roomBtn = document.getElementById('roomBtn'), shareBtn = document.getElementById('shareBtn');
@@ -229,7 +232,7 @@ body.priv #app{filter:blur(24px)}
     send.disabled = !on;
   }
 
-  function announce(join){ publish({ k: 'p', id: me, n: name, j: join ? 1 : 0, u: rnd(8) }); }
+  function announce(join){ publish({ k: 'p', id: me, n: name, j: join ? 1 : 0, v: vanish, vt: vanishT, u: rnd(8) }); }
 
   function onPacket(raw){
     var d; try { d = JSON.parse(raw); } catch (e) { return; }
@@ -245,12 +248,15 @@ body.priv #app{filter:blur(24px)}
       if (peers[id]) peers[id].seen = Date.now();
     } else if (d.k === 'p') {
       peers[id] = { name: cl(d.n, 20) || 'Guest', seen: Date.now() };
+      if (typeof d.v === 'boolean' && Number(d.vt) > vanishT) setVanish(d.v, Number(d.vt), '', false);
       renderPeers();
       if (d.j) setTimeout(function(){ announce(false); }, Math.random() * 800); // let newcomers see us quickly
     } else if (d.k === 'a' || d.k === 'v') {
       var ref = cl(d.ref, 20), tm = null;
       msgs.forEach(function(x){ if (x.mine && x.mid === ref) tm = x; });
       if (tm) { tm.dl[id] = 1; if (d.k === 'v') tm.rd[id] = 1; check(tm); render(); }
+    } else if (d.k === 's') {
+      if (typeof d.on === 'boolean' && Number(d.t) > vanishT) setVanish(d.on, Number(d.t), cl(d.n, 20) || 'Someone', true);
     } else if (d.k === 't') {
       typers[id] = { name: cl(d.n, 20) || 'Guest', at: Date.now() }; showTyping();
     } else if (d.k === 'b') {
@@ -306,7 +312,20 @@ body.priv #app{filter:blur(24px)}
 
   var vanBtn = document.getElementById('vanBtn');
   function vanLabel(){ vanBtn.textContent = vanish ? 'Vanish: on' : 'Vanish: off'; }
-  vanBtn.onclick = function(){ vanish = !vanish; vanLabel(); };
+  var noteEl = document.getElementById('note'), noteTimer = 0;
+  function note(t){ noteEl.textContent = t; noteEl.hidden = false; clearTimeout(noteTimer); noteTimer = setTimeout(function(){ noteEl.hidden = true; }, 4000); }
+  // Vanish is a room-wide setting: any user can change it and everyone follows.
+  function setVanish(on, t, by, announceIt){
+    vanishT = t; vanish = on; vanLabel();
+    msgs.forEach(function(m){ if (m.burn) { clearTimeout(m.burn); m.burn = 0; m.vanishing = false; } });
+    if (on && announceIt) { msgs = []; replyTo = null; replyBar.hidden = true; render(); }
+    if (announceIt) note((by || 'Someone') + ' turned vanish ' + (on ? 'on: chat cleared for everyone' : 'off'));
+  }
+  vanBtn.onclick = function(){
+    var t = Math.max(Date.now(), vanishT + 1);
+    setVanish(!vanish, t, 'You', true);
+    publish({ k: 's', id: me, n: name, on: vanish, t: t, u: rnd(8) });
+  };
   vanLabel();
   var lastSend = 0;
   function doSend(){
